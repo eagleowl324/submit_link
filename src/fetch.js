@@ -2,8 +2,8 @@
 // src/app.js 는 Node.js 식 req/res 를 쓰므로, 같은 모양의 얇은 객체를 만들어 넘기고 결과를 Response 로 돌려줍니다.
 
 // remoteAddress: 접속자 주소. 실행 환경이 알려 주는 값을 넘깁니다.
-export async function serve(app, request, { remoteAddress = '' } = {}) {
-  const url = new URL(request.url);
+// url: 요청의 주소를 request.url 과 다르게 봐야 할 때 넘깁니다(실행 환경이 주소를 바꿔서 넘겨 주는 경우).
+export async function serve(app, request, { remoteAddress = '', url = new URL(request.url) } = {}) {
   const headers = {};
   for (const [name, value] of request.headers) headers[name.toLowerCase()] = value;
 

@@ -9,7 +9,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-import { createVercelHandler, findDatabase } from '../src/vercel.js';
+import { createVercelHandler, findDatabase, originalUrl } from '../src/vercel.js';
 
 const libsql = await import('@libsql/client').catch(() => null);
 const skip = libsql ? false : '@libsql/client 가 설치되어 있지 않습니다. npm install 뒤에 다시 실행하세요.';
@@ -69,6 +69,42 @@ test('환경 변수에서 데이터베이스 주소와 토큰을 찾는다', () 
   // 연결할 때 이름 앞에 다른 말을 붙인 경우
   assert.deepEqual(findDatabase({ SUBMIT_TURSO_DATABASE_URL: 'libsql://b.turso.io', SUBMIT_TURSO_AUTH_TOKEN: 'u' }), { url: 'libsql://b.turso.io', authToken: 'u' });
   assert.deepEqual(findDatabase({ STORAGE_DATABASE_URL: 'libsql://c.turso.io' }), { url: 'libsql://c.turso.io', authToken: undefined });
+});
+
+test('Vercel 이 주소를 어떻게 넘겨 주든 방문자가 요청한 원래 주소로 처리한다', { skip }, async (t) => {
+  const at = (url) => {
+    const found = originalUrl(new Request(ORIGIN + url));
+    return found.pathname + found.search;
+  };
+  // 원래 주소를 그대로 넘겨 주는 경우 (rewrites 가 붙인 __path 는 있을 수도, 없을 수도 있다)
+  assert.equal(at('/a/abc123'), '/a/abc123');
+  assert.equal(at('/a/abc123?__path=/a/abc123'), '/a/abc123');
+  assert.equal(at('/api/site?x=1&__path=/api/site'), '/api/site?x=1');
+  // 함수 자신의 주소로 바꿔 넘겨 주는 경우
+  assert.equal(at('/api/app?__path=/'), '/');
+  assert.equal(at('/api/app?__path=/a/abc123'), '/a/abc123');
+  assert.equal(at('/api/app?__path=/api/admin/session&x=1'), '/api/admin/session?x=1');
+  assert.equal(at('/api/app'), '/api/app');
+  // 다른 곳으로 새지 않는다
+  assert.equal(originalUrl(new Request(`${ORIGIN}/api/app?__path=//evil.example/x`)).host, 'submit-link.example');
+  assert.equal(at('/api/app?__path=evil'), '/api/app');
+
+  // 두 경우 모두 같은 화면과 같은 API 가 나온다.
+  const handler = instance(await temporaryFolder(t));
+  for (const url of ['/', '/api/app?__path=/', '/?__path=/']) {
+    const page = await call(handler, 'GET', url);
+    assert.equal(page.status, 200, url);
+    assert.ok(page.text.includes('<title>과제 링크 제출함</title>'), url);
+  }
+  for (const url of ['/api/admin/session', '/api/app?__path=/api/admin/session', '/api/admin/session?__path=/api/admin/session']) {
+    assert.deepEqual((await call(handler, 'GET', url)).json, { authenticated: false, needsSetup: true, setup: 'web' }, url);
+  }
+  const setup = await call(handler, 'POST', '/api/app?__path=/api/admin/setup', { body: { password: 'teacher-password' } });
+  assert.equal(setup.status, 200);
+  const cookie = setup.headers.get('set-cookie').split(';')[0];
+  assert.equal((await call(handler, 'GET', '/api/app?__path=/api/admin/overview', { cookie })).status, 200);
+  assert.equal((await call(handler, 'GET', '/api/app?__path=/api/admin/overview')).status, 401, '주소를 바꿔 불러도 로그인 없이는 안 된다');
+  assert.equal((await call(handler, 'GET', '/api/app')).status, 404);
 });
 
 test('데이터베이스를 연결하기 전에는 안내문을 보여 준다', async () => {

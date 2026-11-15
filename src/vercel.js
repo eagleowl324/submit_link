@@ -26,6 +26,18 @@ export function findDatabase(env) {
   return null;
 }
 
+// 방문자가 요청한 원래 주소를 구합니다.
+// vercel.json 의 rewrites 는 모든 요청을 이 함수(/api/app)로 보내면서 원래 경로를 __path 로도 실어 보냅니다.
+// Vercel 이 함수에 원래 주소를 그대로 넘겨 주든 함수 자신의 주소로 바꿔 넘겨 주든 같은 결과가 나오게 하기 위해서입니다.
+export function originalUrl(request) {
+  const url = new URL(request.url);
+  const path = url.searchParams.get('__path');
+  if (path === null) return url;
+  url.searchParams.delete('__path');
+  if (url.pathname === '/api/app' && path.startsWith('/')) url.pathname = path;
+  return url;
+}
+
 function notice(status, title, lines) {
   const body = `<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex"><title>${title}</title></head><body><h1>${title}</h1>${lines.map((line) => `<p>${line}</p>`).join('')}</body></html>`;
   return new Response(body, {
@@ -76,6 +88,6 @@ export function createVercelHandler({ env, createClient, serialize = false }) {
         'Vercel 프로젝트의 Storage 탭에서 Turso 데이터베이스를 만들어 이 프로젝트에 연결한 다음, Deployments 탭에서 다시 배포(Redeploy)해 주세요.',
       ]);
     }
-    return serve(app, request);
+    return serve(app, request, { url: originalUrl(request) });
   };
 }
