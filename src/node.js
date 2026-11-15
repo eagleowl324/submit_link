@@ -22,8 +22,9 @@ const CONTENT_TYPES = {
   '.svg': 'image/svg+xml',
 };
 
-// src/db.js 가 요구하는 모양으로 node:sqlite 를 감쌉니다.
+// src/db.js 가 요구하는 모양으로 node:sqlite 를 감쌉니다. 질의하면 바로 답이 나오는(sync) 저장소입니다.
 class SqliteFile {
+  sync = true;
   #db;
   #statements = new Map();
 
@@ -59,10 +60,11 @@ class SqliteFile {
     this.#db.exec(text);
   }
 
+  // 연결이 하나뿐이고 work 가 도중에 멈추지 않으므로, 트랜잭션 안에서도 같은 연결(this)을 그대로 씁니다.
   transaction(work) {
     this.#db.exec('BEGIN IMMEDIATE');
     try {
-      const value = work();
+      const value = work(this);
       this.#db.exec('COMMIT');
       return value;
     } catch (error) {
@@ -83,6 +85,7 @@ function openStore(dataDir) {
     mkdirSync(dataDir, { recursive: true, mode: 0o700 });
     const file = path.join(dataDir, DATABASE_FILE);
     const store = new Store(new SqliteFile(file));
+    store.ready();
     try {
       chmodSync(file, 0o600);
     } catch {
@@ -95,7 +98,7 @@ function openStore(dataDir) {
 }
 
 // /assets/ 아래로 내보낼 파일들. public/ 과 shared/ 에 있는 것만, 주소와 정확히 일치할 때만 내보냅니다.
-function loadAssets() {
+export function loadAssets() {
   const assets = new Map();
   const addFolder = (prefix, folder) => {
     for (const name of readdirSync(folder)) {
@@ -111,6 +114,13 @@ function loadAssets() {
   return assets;
 }
 
+export function loadPages() {
+  return {
+    student: readFileSync(path.join(ROOT, 'public', 'index.html'), 'utf8'),
+    admin: readFileSync(path.join(ROOT, 'public', 'admin.html'), 'utf8'),
+  };
+}
+
 // 서비스를 만들고 HTTP 서버에 연결합니다. listen 은 부르는 쪽에서 합니다.
 // options: dataDir, adminPassword, trustProxy, now, limits (src/app.js 의 createApp 참고)
 export async function createNodeApp(options = {}) {
@@ -124,10 +134,7 @@ export async function createNodeApp(options = {}) {
       store,
       setup: 'console',
       assets: loadAssets(),
-      pages: {
-        student: readFileSync(path.join(ROOT, 'public', 'index.html'), 'utf8'),
-        admin: readFileSync(path.join(ROOT, 'public', 'admin.html'), 'utf8'),
-      },
+      pages: loadPages(),
     });
   } catch (error) {
     store.close();

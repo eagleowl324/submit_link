@@ -1,20 +1,19 @@
 {
-  "name": "assignment-links",
+  "name": "submit-link",
   "version": "1.0.0",
   "description": "학생들에게서 과제 링크를 모으는 작은 웹 서비스",
   "private": true,
   "type": "module",
   "scripts": {
     "start": "node server.js",
+    "build": "node scripts/build-static.mjs",
     "test": "node --test \"test/*.test.js\"",
-    "cf:dev": "wrangler dev",
-    "cf:deploy": "wrangler deploy",
-    "test:cloudflare": "node test/cloudflare-smoke.mjs"
+    "test:libsql": "TEST_STORE=libsql node --test test/api.test.js"
   },
   "engines": {
-    "node": ">=22.13"
+    "node": ">=22.13 <27"
   },
-  "devDependencies": {
-    "wrangler": "^4.162.0"
+  "dependencies": {
+    "@libsql/client": "^0.18.0"
   }
 }

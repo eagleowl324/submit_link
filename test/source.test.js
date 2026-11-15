@@ -5,8 +5,8 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
-const FOLDERS = ['', 'src', 'shared', 'public', 'test'];
-const EXTENSIONS = new Set(['.js', '.html', '.css', '.svg', '.json', '.md', '']);
+const FOLDERS = ['', 'src', 'shared', 'public', 'test', 'api', 'scripts'];
+const EXTENSIONS = new Set(['.js', '.mjs', '.html', '.css', '.svg', '.json', '.md', '']);
 
 // 제어 문자, 폭 없는 문자, 글자 방향을 바꾸는 문자(탭·줄바꿈 제외)
 function isHidden(code) {
@@ -43,4 +43,12 @@ test('소스 파일에 보이지 않는 문자가 글자 그대로 들어 있지
     }
   }
   assert.deepEqual(found, []);
+});
+
+// Vercel 에서는 파일을 읽을 수 없어서 HTML 틀을 src/pages.generated.js 에 담아 둡니다(npm run build).
+// 배포할 때 Vercel 이 다시 만들지만, 저장소에 들어 있는 것도 원본과 같아야 테스트가 실제와 같은 것을 봅니다.
+test('src/pages.generated.js 가 public/*.html 과 같다 (다르면 npm run build)', async () => {
+  const generated = await import('../src/pages.generated.js');
+  assert.equal(generated.student, readFileSync(path.join(ROOT, 'public', 'index.html'), 'utf8'));
+  assert.equal(generated.admin, readFileSync(path.join(ROOT, 'public', 'admin.html'), 'utf8'));
 });

@@ -106,16 +106,26 @@ export function generateAdminPassword() {
   return [randomText(4), randomText(4), randomText(4)].join('-');
 }
 
-// 횟수 기록을 메모리에 두는 기본 보관함. 프로그램을 다시 시작하면 지워집니다.
+// 횟수 기록 보관함은 네 가지를 할 수 있어야 합니다.
+//   peek(key, now)            지금 유효한 기록 { count, resetAt } 또는 null
+//   hit(key, now, windowMs)   횟수를 하나 올리고 올린 뒤의 기록을 돌려줌 (시간 창이 지났으면 1부터)
+//   delete(key), prune(now)
+// 값을 바로 돌려줘도 되고 Promise 로 돌려줘도 됩니다.
+
+// 메모리에 두는 기본 보관함. 프로그램을 다시 시작하면 지워집니다.
 export class MemoryBuckets {
   #map = new Map();
 
-  get(key) {
-    return this.#map.get(key);
+  peek(key, now) {
+    const bucket = this.#map.get(key);
+    return bucket && bucket.resetAt > now ? bucket : null;
   }
 
-  set(key, bucket) {
+  hit(key, now, windowMs) {
+    const live = this.peek(key, now);
+    const bucket = live ? { count: live.count + 1, resetAt: live.resetAt } : { count: 1, resetAt: now + windowMs };
     this.#map.set(key, bucket);
+    return bucket;
   }
 
   delete(key) {
@@ -129,9 +139,45 @@ export class MemoryBuckets {
   }
 }
 
+// 저장소(src/db.js)에 남기는 보관함. 프로그램이 수시로 내려갔다 올라오거나 여러 개가 동시에 도는 실행 환경(Vercel)에서 씁니다.
+// 비밀번호를 틀린 횟수처럼 지켜야 하는 기록만 저장소에 두고, 접속자별 요청 수(post:)는 잠깐만 필요하고
+// 요청마다 바뀌어서 메모리에만 둡니다.
+export class StoredBuckets {
+  #store;
+  #memory = new MemoryBuckets();
+
+  constructor(store) {
+    this.#store = store;
+  }
+
+  #inMemory(key) {
+    return key.startsWith('post:');
+  }
+
+  async peek(key, now) {
+    if (this.#inMemory(key)) return this.#memory.peek(key, now);
+    const row = await this.#store.getRateLimit(key);
+    return row && row.reset_at > now ? { count: row.count, resetAt: row.reset_at } : null;
+  }
+
+  async hit(key, now, windowMs) {
+    if (this.#inMemory(key)) return this.#memory.hit(key, now, windowMs);
+    const row = await this.#store.hitRateLimit(key, now, now + windowMs);
+    return { count: row.count, resetAt: row.reset_at };
+  }
+
+  async delete(key) {
+    if (this.#inMemory(key)) this.#memory.delete(key);
+    else await this.#store.deleteRateLimit(key);
+  }
+
+  async prune(now) {
+    this.#memory.prune(now);
+    await this.#store.pruneRateLimits(now);
+  }
+}
+
 // 정해진 시간 창 안에서 횟수를 세는 간단한 제한기.
-// buckets 는 { get, set, delete, prune } 을 가진 보관함입니다. 기본은 메모리이고,
-// 프로그램이 수시로 내려갔다 올라오는 실행 환경(Cloudflare)에서는 저장소에 남기는 보관함을 넣습니다.
 export class RateLimiter {
   constructor(clock = Date.now, buckets = new MemoryBuckets()) {
     this.clock = clock;
@@ -139,24 +185,22 @@ export class RateLimiter {
   }
 
   // 시도 한 번을 기록하고, 한도를 넘었으면 allowed: false 와 남은 시간(초)을 돌려줍니다.
-  take(key, limit, windowMs) {
+  async take(key, limit, windowMs) {
     const now = this.clock();
-    const saved = this.buckets.get(key);
-    const live = saved && saved.resetAt > now ? saved : null;
     const blocked = (bucket) => ({ allowed: false, retryAfter: Math.max(1, Math.ceil((bucket.resetAt - now) / 1000)) });
     // 이미 막힌 상태에서는 더 기록하지 않습니다. 막힌 요청이 몰려와도 보관함에 쓰는 일이 늘지 않습니다.
+    const live = await this.buckets.peek(key, now);
     if (live && live.count > limit) return blocked(live);
 
-    const bucket = live ? { count: live.count + 1, resetAt: live.resetAt } : { count: 1, resetAt: now + windowMs };
-    this.buckets.set(key, bucket);
+    const bucket = await this.buckets.hit(key, now, windowMs);
     return bucket.count > limit ? blocked(bucket) : { allowed: true, retryAfter: 0 };
   }
 
-  reset(key) {
-    this.buckets.delete(key);
+  async reset(key) {
+    await this.buckets.delete(key);
   }
 
-  prune() {
-    this.buckets.prune(this.clock());
+  async prune() {
+    await this.buckets.prune(this.clock());
   }
 }

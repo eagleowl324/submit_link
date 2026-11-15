@@ -6,7 +6,8 @@ import path from 'node:path';
 import test from 'node:test';
 
 import { isProxyPeer, rateKey } from '../src/app.js';
-import { createNodeApp as createApp, logoutAll, resetAdminPassword } from '../src/node.js';
+import { logoutAll, resetAdminPassword } from '../src/node.js';
+import { USING_LIBSQL, createApp } from './support.js';
 
 const ADMIN_PASSWORD = 'teacher-password';
 
@@ -618,7 +619,9 @@ test('ADMIN_PASSWORD 를 쓰면 화면에서 비밀번호를 바꿀 수 없고, 
   assert.equal(response.json.error.code, 'managed_by_env');
 
   await assert.rejects(() => createApp({ dataDir: os.tmpdir(), adminPassword: 'short' }), /8자 이상/);
-  await assert.rejects(() => createApp({ dataDir: '/dev/null/cannot-write-here', adminPassword: ADMIN_PASSWORD }), /데이터 폴더를 쓸 수 없습니다/);
+  if (!USING_LIBSQL) {
+    await assert.rejects(() => createApp({ dataDir: '/dev/null/cannot-write-here', adminPassword: ADMIN_PASSWORD }), /데이터 폴더를 쓸 수 없습니다/);
+  }
 });
 
 test('서버를 껐다 켜도 과제·제출·로그인이 남아 있다', async (t) => {
@@ -814,7 +817,7 @@ test('X-Forwarded-For 는 같은 컴퓨터나 사설망에서 온 접속일 때�
   }
 });
 
-test('데이터 파일은 본인만 읽을 수 있게 만든다', { skip: process.platform === 'win32' }, async (t) => {
+test('데이터 파일은 본인만 읽을 수 있게 만든다', { skip: process.platform === 'win32' || USING_LIBSQL }, async (t) => {
   const { dataDir } = await start(t);
   const { statSync } = await import('node:fs');
   assert.equal(statSync(path.join(dataDir, 'submissions.db')).mode & 0o077, 0);

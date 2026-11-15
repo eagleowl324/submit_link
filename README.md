@@ -1,7 +1,9 @@
 # 과제 링크 제출함
 
 학생들에게서 과제 링크(구글 문서, 깃허브, 노션, 유튜브, 직접 만든 웹페이지 등)를 모으는 작은 웹 서비스입니다.
-따로 설치할 패키지 없이 Node.js만 있으면 실행됩니다.
+
+- **Vercel에 무료로 올려서** 인터넷 어디서나 쓰거나 ([방법](#3-vercel에-무료로-올리기)),
+- **내 컴퓨터나 서버에서** Node.js만으로 바로 실행할 수 있습니다. 이때는 따로 설치할 패키지가 없습니다.
 
 ## 할 수 있는 일
 
@@ -19,7 +21,7 @@
 - 학생이 링크를 바꾸면 이전 링크가 기록으로 남습니다. 마감 뒤에 링크를 바꾼 제출은 "지각"으로 표시됩니다. (이름이나 메모만 고친 것은 지각으로 치지 않습니다.)
 - 비밀번호를 잊은 학생은 비밀번호만 초기화해 줄 수 있습니다.
 
-## 시작하기
+## 내 컴퓨터에서 시작하기
 
 1. [Node.js](https://nodejs.org) 22.13 이상을 설치합니다. (LTS 버전이면 됩니다.)
 2. 이 저장소를 내려받아(GitHub 화면의 **Code** 버튼 → **Download ZIP**) 압축을 풀고, 그 폴더에서 서버를 실행합니다. Windows에서는 `start.bat`을 두 번 눌러도 됩니다.
@@ -67,29 +69,49 @@ cloudflared tunnel --url http://localhost:3000
 Windows 명령 프롬프트에서는 `set HOST=127.0.0.1` 과 `set TRUST_PROXY=1` 을 차례로 실행한 다음 `node server.js` 를 실행합니다.
 이 주소는 실행할 때마다 바뀌고 컴퓨터를 끄면 닫히므로, 수업 시간 안에 걷는 과제에 알맞습니다.
 
-### 3. 항상 켜 두기 (서버, 클라우드)
+### 3. Vercel에 무료로 올리기
 
-며칠에 걸쳐 받으려면 항상 켜져 있는 곳에 올립니다. `Dockerfile`이 들어 있습니다.
+내 컴퓨터를 켜 두지 않아도 되고, `https://프로젝트이름.vercel.app` 같은 주소로 어디서나 접속할 수 있습니다.
+Vercel의 무료(Hobby) 요금제와, Vercel 안에서 만드는 무료 데이터베이스(Turso)를 씁니다.
+Vercel은 서버에 파일을 남기지 못하기 때문에 제출 내용은 이 데이터베이스에 저장됩니다.
+
+1. [vercel.com](https://vercel.com)에 GitHub 계정으로 로그인합니다.
+2. **Add New → Project**에서 이 저장소를 골라 **Import**하고, 설정은 그대로 둔 채 **Deploy**를 누릅니다.
+3. 배포가 끝나고 주소를 열면 "데이터베이스를 연결해 주세요"라는 안내가 나옵니다. 프로젝트의 **Storage** 탭에서 **Turso** 데이터베이스를 새로 만들어 이 프로젝트에 연결합니다. 지역을 고를 수 있으면 도쿄(Tokyo)를 고르세요.
+4. **Deployments** 탭에서 가장 최근 배포의 메뉴를 열어 **Redeploy**합니다. 데이터베이스 연결 정보는 새로 배포할 때부터 적용됩니다.
+5. `주소/admin`을 열어 **관리자 비밀번호를 정합니다.** 가장 먼저 정한 사람이 관리자가 되므로, 학생들에게 주소를 알리기 전에 바로 하세요.
+
+이후에는 이 저장소의 `main` 브랜치가 바뀔 때마다 Vercel이 자동으로 다시 배포합니다. 데이터는 데이터베이스에 있으므로 다시 배포해도 지워지지 않습니다.
+
+- **관리자 비밀번호를 잊었다면** Vercel 프로젝트의 **Settings → Environment Variables**에 `ADMIN_PASSWORD`(8자 이상)를 추가하고 다시 배포하세요. 그 값으로 로그인됩니다.
+- 서비스는 도쿄 지역에서 실행되도록 정해 두었습니다(`vercel.json`의 `regions`). 데이터베이스가 다른 지역에 있으면 응답이 느려집니다.
+- 무료 요금제에는 사용량 한도가 있고 개인·비상업 용도로 쓰게 되어 있습니다. 한 반이나 한 학년이 쓰는 정도로는 한도에 닿지 않습니다.
+
+### 4. 내 서버에서 항상 켜 두기 (Docker)
+
+직접 운영하는 서버가 있다면 `Dockerfile`로 올릴 수 있습니다.
 
 ```bash
-docker build -t assignment-links .
+docker build -t submit-link .
 ```
 
 ```bash
-docker run -d --name assignment-links --restart unless-stopped \
+docker run -d --name submit-link --restart unless-stopped \
   -p 3000:3000 \
-  -v assignment-links-data:/data \
+  -v submit-link-data:/data \
   -e ADMIN_PASSWORD='길고-추측하기-어려운-비밀번호' \
-  assignment-links
+  submit-link
 ```
 
-올릴 곳을 고를 때 꼭 확인할 점이 두 가지 있습니다.
+꼭 확인할 점이 두 가지 있습니다.
 
-- **데이터가 남는 저장 공간.** 제출 내용은 `/data` 폴더의 파일 하나에 저장됩니다. 다시 배포하거나 재시작할 때 디스크가 초기화되는 호스팅에서는 제출이 모두 사라지므로, 반드시 볼륨(영구 디스크)을 `/data`에 연결하세요.
-- **HTTPS.** 이 서버는 HTTP로만 응답합니다. 인터넷에 공개할 때는 HTTPS를 붙여 주는 호스팅이나 리버스 프록시(Caddy, nginx 등) 뒤에 두고, `TRUST_PROXY=1`을 함께 설정하세요.
+- **데이터가 남는 저장 공간.** 제출 내용은 `/data` 폴더의 파일 하나에 저장됩니다. 볼륨(영구 디스크)을 `/data`에 연결하지 않으면 컨테이너를 지울 때 제출이 모두 사라집니다.
+- **HTTPS.** 이 서버는 HTTP로만 응답합니다. 인터넷에 공개할 때는 HTTPS를 붙여 주는 리버스 프록시(Caddy, nginx 등) 뒤에 두고, `TRUST_PROXY=1`을 함께 설정하세요.
   프록시가 같은 서버에 있다면 위 명령의 `-p 3000:3000`을 `-p 127.0.0.1:3000:3000`으로 바꿔서, 프록시를 거치지 않고는 접속할 수 없게 하세요.
 
 ## 환경 변수
+
+직접 실행하는 서버(`node server.js`, Docker)에서 쓰는 값입니다.
 
 | 이름 | 기본값 | 설명 |
 | --- | --- | --- |
@@ -99,10 +121,19 @@ docker run -d --name assignment-links --restart unless-stopped \
 | `ADMIN_PASSWORD` | 없음 | 관리자 비밀번호(8자 이상). 정하면 관리 화면에서는 바꿀 수 없습니다. 정하지 않으면 처음 실행할 때 자동으로 만들어 실행 창에 보여 줍니다. |
 | `TRUST_PROXY` | `0` | 서버 앞에 있는 프록시의 개수. 프록시나 터널 뒤에서는 `1`로 두어야 접속자별 요청 제한이 제대로 동작합니다. 프록시 없이 직접 받는 서버에서는 `0`으로 두세요. 프록시가 알려 주는 접속자 주소(`X-Forwarded-For`)는 같은 컴퓨터나 사설망에서 들어온 접속일 때만 믿습니다. |
 
+Vercel에서는 아래 값을 씁니다. 앞의 둘은 Storage에서 데이터베이스를 연결하면 Vercel이 자동으로 넣어 줍니다.
+
+| 이름 | 설명 |
+| --- | --- |
+| `TURSO_DATABASE_URL` | 데이터베이스 주소 (`libsql://...`) |
+| `TURSO_AUTH_TOKEN` | 데이터베이스 접속 토큰 |
+| `ADMIN_PASSWORD` | (선택) 관리자 비밀번호. 넣지 않으면 관리 화면에 처음 들어갔을 때 정합니다. |
+
 ## 데이터와 백업
 
-- 모든 데이터는 `data/submissions.db`(SQLite) 파일 하나에 들어 있습니다.
-- 백업하려면 서버를 멈춘 뒤 이 파일을 복사해 두세요. 과제별 CSV를 내려받아 두는 것도 방법입니다.
+- 직접 실행하는 서버에서는 모든 데이터가 `data/submissions.db`(SQLite) 파일 하나에 들어 있습니다. 백업하려면 서버를 멈춘 뒤 이 파일을 복사해 두세요.
+- Vercel에서는 Storage에 연결한 데이터베이스에 들어 있습니다.
+- 어느 쪽이든 과제별 CSV를 내려받아 두면 제출 현황을 따로 보관할 수 있습니다.
 - 과제를 삭제하면 그 과제의 제출과 이전 제출 기록도 함께 지워집니다.
 
 ## 알아 둘 점
@@ -117,7 +148,9 @@ docker run -d --name assignment-links --restart unless-stopped \
   node server.js --logout-all
   ```
 
-- 서버 프로그램은 한 개만 실행하세요. 요청 제한을 메모리에 기록하기 때문에 여러 개를 동시에 띄우는 구성은 지원하지 않습니다.
+  (이 명령은 직접 실행하는 서버용입니다. Vercel에서는 **설정 → 다른 기기에서 로그아웃**을 쓰거나 `ADMIN_PASSWORD`를 바꿔 다시 배포하세요.)
+
+- 직접 실행하는 서버는 프로그램을 한 개만 띄우세요. 요청 제한을 메모리에 기록하기 때문에 여러 개를 동시에 띄우는 구성은 지원하지 않습니다. (Vercel에서는 이 기록을 데이터베이스에 남깁니다.)
 - 학번과 이름은 개인정보입니다. 학기가 끝나면 CSV로 내려받은 뒤 과제를 삭제하는 것을 권합니다.
 
 ## 개발
@@ -127,15 +160,31 @@ npm test
 ```
 
 Node.js 내장 테스트 러너로 서버 동작(제출, 마감, 비밀번호, 명단, 관리자 인증, 요청 위조 차단, 보안 헤더 등)을 검사합니다.
+Vercel에서 쓰는 저장 방식까지 검사하려면 패키지를 설치한 뒤 실행합니다.
+
+```bash
+npm install
+```
+
+```bash
+npm run test:libsql
+```
 
 ```
-server.js          실행 파일
-src/app.js         HTTP 서버: 주소별 처리, 인증, 요청 제한
-src/db.js          SQLite 저장소와 스키마
-src/security.js    비밀번호 해시, 토큰, 요청 제한기
-src/main.js        환경 변수 읽기와 시작·종료
-shared/rules.js    입력 검사 규칙 (서버와 브라우저가 함께 사용)
-shared/csv.js      CSV 만들기
-public/            학생 화면(index.html, student.js)과 관리 화면(admin.html, admin.js)
-test/              자동 테스트
+server.js            직접 실행하는 서버의 시작 파일
+api/app.js           Vercel 이 실행하는 시작 파일
+src/app.js           서비스 로직: 주소별 처리, 인증, 요청 제한 (실행 환경과 무관)
+src/db.js            저장소: 과제·제출·명단·설정을 SQL 로 다룸 (실행 환경과 무관)
+src/security.js      비밀번호 해시, 토큰, 요청 제한기
+src/node.js          직접 실행하는 서버 쪽: SQLite 파일, 정적 파일, HTTP 서버
+src/main.js          환경 변수 읽기와 시작·종료
+src/vercel.js        Vercel 쪽: 데이터베이스 연결, 첫 비밀번호 설정
+src/libsql.js        Turso(libSQL) 데이터베이스 연결
+src/fetch.js         웹 표준 요청·응답을 서비스 로직에 연결
+shared/rules.js      입력 검사 규칙 (서버와 브라우저가 함께 사용)
+shared/csv.js        CSV 만들기
+public/              학생 화면(index.html, student.js)과 관리 화면(admin.html, admin.js)
+scripts/             Vercel 배포용 빌드
+vercel.json          Vercel 배포 설정
+test/                자동 테스트
 ```

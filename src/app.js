@@ -1,8 +1,11 @@
 // 서비스의 핵심 로직: 주소별 처리, 인증, 요청 제한.
 //
 // 이 파일은 특정 실행 환경에 묶이지 않습니다. 저장소(store)와 화면(pages), 정적 파일(assets)을 밖에서 받아서
-// Node.js(src/node.js)와 Cloudflare Workers(cloudflare/worker.js) 양쪽에서 같은 코드로 동작합니다.
-// 요청과 응답은 Node.js 의 req/res 모양을 따르고, Cloudflare 쪽은 같은 모양의 얇은 객체를 만들어 넘깁니다.
+// 직접 띄우는 Node.js 서버(src/node.js)와 Vercel(src/vercel.js) 양쪽에서 같은 코드로 동작합니다.
+// 요청과 응답은 Node.js 의 req/res 모양을 따르고, Vercel 쪽은 같은 모양의 얇은 객체를 만들어 넘깁니다(src/fetch.js).
+//
+// 저장소는 바로 답하는 것(파일 SQLite)일 수도, 네트워크 너머에 있어 기다려야 하는 것(Vercel 의 데이터베이스)일 수도
+// 있습니다. 그래서 store 와 limiter 를 부르는 곳은 모두 await 합니다.
 
 import { Buffer } from 'node:buffer';
 
@@ -257,27 +260,29 @@ export async function createApp(options = {}) {
     throw new ConfigError(`ADMIN_PASSWORD 는 ${LIMITS.adminPasswordMin}자 이상이어야 합니다.`);
   }
 
+  await store.ready();
+
   // 비밀번호를 정해 주지 않았다면 처음 한 번 무작위로 만들어 알려 줍니다. ('web' 방식에서는 관리 화면에서 정합니다.)
   let generatedAdminPassword = null;
-  if (setup === 'console' && !adminPassword && !store.getSetting('admin_password_hash')) {
+  if (setup === 'console' && !adminPassword && !(await store.getSetting('admin_password_hash'))) {
     generatedAdminPassword = generateAdminPassword();
-    store.setSetting('admin_password_hash', await hasher.hash(generatedAdminPassword));
+    await store.setSetting('admin_password_hash', await hasher.hash(generatedAdminPassword));
   }
 
   // 관리자 비밀번호를 정하는 방식이나 값이 바뀌었으면(ADMIN_PASSWORD 를 바꾸거나 없앴으면) 예전 로그인을 모두 끊습니다.
   // 비밀번호를 바꿨는데 예전에 로그인해 둔 기기가 계속 들어올 수 있으면 안 되기 때문입니다.
-  const authMarker = store.getSetting('admin_auth_marker');
+  const authMarker = await store.getSetting('admin_auth_marker');
   const sameAuth = adminPassword ? Boolean(authMarker) && (await hasher.verify(adminPassword, authMarker)) : authMarker === 'stored';
   if (!sameAuth) {
-    store.deleteAllSessions();
-    store.setSetting('admin_auth_marker', adminPassword ? await hasher.hash(adminPassword) : 'stored');
+    await store.deleteAllSessions();
+    await store.setSetting('admin_auth_marker', adminPassword ? await hasher.hash(adminPassword) : 'stored');
   }
 
   // 관리자 비밀번호가 아직 없어서 관리 화면에서 처음 정해야 하는 상태인가
-  const needsSetup = () => setup === 'web' && !adminPassword && !store.getSetting('admin_password_hash');
+  const needsSetup = async () => setup === 'web' && !adminPassword && !(await store.getSetting('admin_password_hash'));
 
-  const siteTitle = () => store.getSetting('site_title') || DEFAULT_TITLE;
-  const rosterOnly = () => store.getSetting('roster_only') === '1';
+  const siteTitle = async () => (await store.getSetting('site_title')) || DEFAULT_TITLE;
+  const rosterOnly = async () => (await store.getSetting('roster_only')) === '1';
 
   // ── 응답 ────────────────────────────────────────────────────────────────
 
@@ -328,73 +333,73 @@ export async function createApp(options = {}) {
     return `${SESSION_COOKIE}=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${maxAge}${isHttps(req) ? '; Secure' : ''}`;
   }
 
-  function currentSession(req) {
+  async function currentSession(req) {
     const token = readCookie(req, SESSION_COOKIE);
     if (!token) return null;
     const tokenHash = sha256(token);
-    return store.findSession(tokenHash, now().toISOString()) ? { tokenHash } : null;
+    return (await store.findSession(tokenHash, now().toISOString())) ? { tokenHash } : null;
   }
 
   function admin(handler) {
-    return (context) => {
-      const session = currentSession(context.req);
+    return async (context) => {
+      const session = await currentSession(context.req);
       if (!session) throw new HttpError(401, 'unauthorized', '로그인이 필요합니다.');
       return handler({ ...context, session });
     };
   }
 
-  function throttlePosts(req) {
-    const gate = limiter.take(`post:${clientIp(req)}`, POSTS_PER_MINUTE, 60 * 1000);
+  async function throttlePosts(req) {
+    const gate = await limiter.take(`post:${clientIp(req)}`, POSTS_PER_MINUTE, 60 * 1000);
     if (!gate.allowed) throw tooMany(gate.retryAfter, '요청이 너무 많습니다.');
   }
 
   // 시도 횟수를 먼저 세고 나서 확인합니다. 동시에 여러 번 찔러 보는 것을 막기 위해서입니다.
   async function requireStudentPassword(assignmentId, studentId, password, storedHash, wrongMessage) {
     const key = `password:${assignmentId}:${studentId}`;
-    const gate = limiter.take(key, PASSWORD_ATTEMPTS, ATTEMPT_WINDOW_MS);
+    const gate = await limiter.take(key, PASSWORD_ATTEMPTS, ATTEMPT_WINDOW_MS);
     if (!gate.allowed) throw tooMany(gate.retryAfter, '비밀번호를 여러 번 틀려서 이 학번의 제출이 잠시 막혔습니다.');
     if (!(await hasher.verify(password, storedHash))) {
       throw new HttpError(403, 'wrong_password', wrongMessage, { fields: { password: wrongMessage } });
     }
-    limiter.reset(key);
+    await limiter.reset(key);
   }
 
   async function isAdminPassword(password) {
     if (!password || password.length > LIMITS.adminPasswordMax) return false;
     if (adminPassword) return sameSecret(password, adminPassword);
-    const stored = store.getSetting('admin_password_hash');
+    const stored = await store.getSetting('admin_password_hash');
     return stored ? hasher.verify(password, stored) : false;
   }
 
   async function requireAdminPassword(req, password, error) {
     const key = `login:${clientIp(req)}`;
-    const gate = limiter.take(key, LOGIN_ATTEMPTS, ATTEMPT_WINDOW_MS);
+    const gate = await limiter.take(key, LOGIN_ATTEMPTS, ATTEMPT_WINDOW_MS);
     if (!gate.allowed) throw tooMany(gate.retryAfter, '비밀번호를 여러 번 틀렸습니다.');
     if (!(await isAdminPassword(password))) throw error;
-    limiter.reset(key);
+    await limiter.reset(key);
   }
 
-  function findAssignmentBySlug(slug) {
-    const assignment = store.getAssignmentBySlug(slug);
+  async function findAssignmentBySlug(slug) {
+    const assignment = await store.getAssignmentBySlug(slug);
     if (!assignment) throw new HttpError(404, 'not_found', '과제를 찾을 수 없습니다.');
     return assignment;
   }
 
-  function findAssignment(id) {
-    const assignment = store.getAssignment(Number(id));
+  async function findAssignment(id) {
+    const assignment = await store.getAssignment(Number(id));
     if (!assignment) throw new HttpError(404, 'not_found', '과제를 찾을 수 없습니다. 이미 삭제되었을 수 있습니다.');
     return assignment;
   }
 
   // ── 화면과 정적 파일 ─────────────────────────────────────────────────────
 
-  function pageStudent({ res, params }) {
-    const title = siteTitle();
+  async function pageStudent({ res, params }) {
+    const title = await siteTitle();
     if (!params[0]) {
       sendHtml(res, 200, fillTemplate(pages.student, { title, description: '과제 링크를 제출하는 곳입니다.' }));
       return;
     }
-    const assignment = store.getAssignmentBySlug(params[0]);
+    const assignment = await store.getAssignmentBySlug(params[0]);
     if (!assignment) {
       sendHtml(res, 404, fillTemplate(pages.student, { title, description: '과제를 찾을 수 없습니다.' }));
       return;
@@ -403,8 +408,8 @@ export async function createApp(options = {}) {
     sendHtml(res, 200, fillTemplate(pages.student, { title: `${assignment.title} · ${title}`, description: summary }));
   }
 
-  function pageAdmin({ res }) {
-    sendHtml(res, 200, fillTemplate(pages.admin, { title: `관리 · ${siteTitle()}` }));
+  async function pageAdmin({ res }) {
+    sendHtml(res, 200, fillTemplate(pages.admin, { title: `관리 · ${await siteTitle()}` }));
   }
 
   function serveAsset({ req, res, params }) {
@@ -421,32 +426,29 @@ export async function createApp(options = {}) {
 
   // ── 학생용 API ───────────────────────────────────────────────────────────
 
-  function apiSite({ res }) {
+  async function apiSite({ res }) {
     const at = now();
-    const assignments = store
-      .listAssignments()
-      .map((assignment) => publicAssignment(assignment, at))
-      .sort(compareForStudents);
-    sendJson(res, 200, { title: siteTitle(), assignments });
+    const assignments = (await store.listAssignments()).map((assignment) => publicAssignment(assignment, at)).sort(compareForStudents);
+    sendJson(res, 200, { title: await siteTitle(), assignments });
   }
 
   async function apiSubmit({ req, res, params }) {
-    throttlePosts(req);
-    findAssignmentBySlug(params[0]);
+    await throttlePosts(req);
+    await findAssignmentBySlug(params[0]);
     const { value, errors } = validateSubmission(await readJson(req, BODY_LIMIT));
     if (errors) throw invalid(errors);
 
     // 본문을 받는 동안 선생님이 과제를 닫거나 지웠을 수 있으므로, 과제는 본문을 다 받은 뒤에 읽습니다.
     // 마감과 지각도 이 시각으로 판단합니다.
-    const assignment = findAssignmentBySlug(params[0]);
+    const assignment = await findAssignmentBySlug(params[0]);
     const at = now();
     if (assignmentState(assignment, at) === 'closed') {
       throw new HttpError(403, 'closed', '이 과제는 제출이 마감되었습니다.');
     }
 
-    const existing = store.getSubmission(assignment.id, value.studentId);
+    const existing = await store.getSubmission(assignment.id, value.studentId);
     // "명단에 있는 학번만 받기"를 켜 두면 학번 오타나 장난 제출을 처음부터 막습니다.
-    if (!existing && rosterOnly() && store.rosterCount() > 0 && !store.isInRoster(value.studentId)) {
+    if (!existing && (await rosterOnly()) && (await store.rosterCount()) > 0 && !(await store.isInRoster(value.studentId))) {
       throw invalid({ studentId: '명단에 없는 학번입니다. 학번을 다시 확인하고, 맞게 썼다면 선생님께 말씀드리세요.' });
     }
     let passwordHash;
@@ -457,7 +459,7 @@ export async function createApp(options = {}) {
       passwordHash = await hasher.hash(value.password);
     }
 
-    const saved = store.saveSubmission({
+    const saved = await store.saveSubmission({
       assignmentId: assignment.id,
       studentId: value.studentId,
       name: value.name,
@@ -486,8 +488,8 @@ export async function createApp(options = {}) {
   }
 
   async function apiLookup({ req, res, params }) {
-    throttlePosts(req);
-    const assignment = findAssignmentBySlug(params[0]);
+    await throttlePosts(req);
+    const assignment = await findAssignmentBySlug(params[0]);
     const body = await readJson(req, BODY_LIMIT);
 
     const fields = {};
@@ -498,7 +500,7 @@ export async function createApp(options = {}) {
     else if (password.length > LIMITS.passwordMax) fields.password = '비밀번호가 맞지 않습니다.';
     if (Object.keys(fields).length) throw invalid(fields);
 
-    const existing = store.getSubmission(assignment.id, studentId);
+    const existing = await store.getSubmission(assignment.id, studentId);
     if (!existing) throw new HttpError(404, 'no_submission', '이 학번으로 제출된 링크가 없습니다.');
     if (!existing.password_hash) {
       throw new HttpError(403, 'password_reset', '선생님이 비밀번호를 초기화했습니다. 링크를 다시 제출하면서 새 비밀번호를 정하세요.');
@@ -513,20 +515,21 @@ export async function createApp(options = {}) {
     const body = await readJson(req, BODY_LIMIT);
     const password = typeof body.password === 'string' ? body.password : '';
     await requireAdminPassword(req, password, new HttpError(401, 'wrong_password', '비밀번호가 맞지 않습니다.'));
-    startSession(req, res);
+    await startSession(req, res);
   }
 
-  function startSession(req, res) {
+  async function startSession(req, res) {
     const at = now();
-    store.pruneSessions(at.toISOString());
+    await store.pruneSessions(at.toISOString());
     const token = newToken();
-    store.createSession(sha256(token), at.toISOString(), new Date(at.getTime() + SESSION_SECONDS * 1000).toISOString());
+    await store.createSession(sha256(token), at.toISOString(), new Date(at.getTime() + SESSION_SECONDS * 1000).toISOString());
     sendJson(res, 200, { ok: true }, { 'Set-Cookie': sessionCookie(req, token, SESSION_SECONDS) });
   }
 
   // 관리자 비밀번호를 처음 정합니다. 아직 아무도 정하지 않았을 때 한 번만 됩니다('web' 방식).
   async function apiSetup({ req, res }) {
-    if (!needsSetup()) throw new HttpError(409, 'already_set', '관리자 비밀번호가 이미 정해져 있습니다. 로그인해 주세요.');
+    const alreadySet = new HttpError(409, 'already_set', '관리자 비밀번호가 이미 정해져 있습니다. 로그인해 주세요.');
+    if (!(await needsSetup())) throw alreadySet;
     const body = await readJson(req, BODY_LIMIT);
     const password = typeof body.password === 'string' ? body.password : '';
     if (password.length < LIMITS.adminPasswordMin) {
@@ -536,36 +539,35 @@ export async function createApp(options = {}) {
       throw invalid({ password: `비밀번호는 ${LIMITS.adminPasswordMax}자까지 쓸 수 있습니다.` });
     }
     const hash = await hasher.hash(password);
-    // 해시를 계산하는 사이에 다른 사람이 먼저 정했다면 그쪽이 우선입니다.
-    if (!needsSetup()) throw new HttpError(409, 'already_set', '관리자 비밀번호가 이미 정해져 있습니다. 로그인해 주세요.');
-    store.setSetting('admin_password_hash', hash);
-    startSession(req, res);
+    // "아직 없을 때만 저장"을 저장소가 한 번에 처리합니다. 여러 사람이 동시에 정하려 해도 먼저 저장한 한 사람만 됩니다.
+    if (!(await store.claimSetting('admin_password_hash', hash))) throw alreadySet;
+    await startSession(req, res);
   }
 
-  function apiLogout({ req, res }) {
+  async function apiLogout({ req, res }) {
     const token = readCookie(req, SESSION_COOKIE);
-    if (token) store.deleteSession(sha256(token));
+    if (token) await store.deleteSession(sha256(token));
     sendJson(res, 200, { ok: true }, { 'Set-Cookie': sessionCookie(req, '', 0) });
   }
 
-  function apiLogoutOthers({ res, session }) {
-    store.deleteOtherSessions(session.tokenHash);
+  async function apiLogoutOthers({ res, session }) {
+    await store.deleteOtherSessions(session.tokenHash);
     sendJson(res, 200, { ok: true });
   }
 
-  function apiSession({ req, res }) {
+  async function apiSession({ req, res }) {
     // setup 은 로그인 화면이 알맞은 안내문을 고르는 데 씁니다.
-    sendJson(res, 200, { authenticated: Boolean(currentSession(req)), needsSetup: needsSetup(), setup });
+    sendJson(res, 200, { authenticated: Boolean(await currentSession(req)), needsSetup: await needsSetup(), setup });
   }
 
-  function apiOverview({ res }) {
+  async function apiOverview({ res }) {
     const at = now();
-    const stats = new Map(store.submissionStats().map((row) => [row.assignment_id, row]));
+    const stats = new Map((await store.submissionStats()).map((row) => [row.assignment_id, row]));
     sendJson(res, 200, {
-      title: siteTitle(),
-      rosterCount: store.rosterCount(),
+      title: await siteTitle(),
+      rosterCount: await store.rosterCount(),
       passwordFromEnv: Boolean(adminPassword),
-      assignments: store.listAssignments().map((assignment) => ({
+      assignments: (await store.listAssignments()).map((assignment) => ({
         ...adminAssignment(assignment, at),
         submissionCount: stats.get(assignment.id)?.total ?? 0,
         lateCount: stats.get(assignment.id)?.late ?? 0,
@@ -577,46 +579,48 @@ export async function createApp(options = {}) {
     const { value, errors } = validateAssignment(await readJson(req, BODY_LIMIT));
     if (errors) throw invalid(errors);
     let slug = randomSlug();
-    while (store.getAssignmentBySlug(slug)) slug = randomSlug();
+    while (await store.getAssignmentBySlug(slug)) slug = randomSlug();
     const at = now();
-    const assignment = store.createAssignment({ slug, ...value, createdAt: at.toISOString() });
+    const assignment = await store.createAssignment({ slug, ...value, createdAt: at.toISOString() });
     sendJson(res, 201, { assignment: adminAssignment(assignment, at) });
   }
 
   async function apiUpdateAssignment({ req, res, params }) {
-    const existing = findAssignment(params[0]);
+    const existing = await findAssignment(params[0]);
     const { value, errors } = validateAssignment(await readJson(req, BODY_LIMIT));
     if (errors) throw invalid(errors);
-    sendJson(res, 200, { assignment: adminAssignment(store.updateAssignment(existing.id, value), now()) });
+    sendJson(res, 200, { assignment: adminAssignment(await store.updateAssignment(existing.id, value), now()) });
   }
 
-  function apiDeleteAssignment({ res, params }) {
-    store.deleteAssignment(findAssignment(params[0]).id);
+  async function apiDeleteAssignment({ res, params }) {
+    const assignment = await findAssignment(params[0]);
+    await store.deleteAssignment(assignment.id);
     sendJson(res, 200, { ok: true });
   }
 
-  function apiListSubmissions({ res, params }) {
-    const assignment = findAssignment(params[0]);
-    const rosterCount = store.rosterCount();
+  async function apiListSubmissions({ res, params }) {
+    const assignment = await findAssignment(params[0]);
+    const rosterCount = await store.rosterCount();
+    const submissions = await store.listSubmissions(assignment.id);
+    const missing = rosterCount ? await store.missingStudents(assignment.id) : [];
     sendJson(res, 200, {
       assignment: adminAssignment(assignment, now()),
       rosterCount,
-      submissions: store.listSubmissions(assignment.id).map((row) => adminSubmission(row, assignment)),
-      missing: rosterCount
-        ? store.missingStudents(assignment.id).map((row) => ({ studentId: row.student_id, name: row.name }))
-        : [],
+      submissions: submissions.map((row) => adminSubmission(row, assignment)),
+      missing: missing.map((row) => ({ studentId: row.student_id, name: row.name })),
     });
   }
 
   // 제출 한 건과 이전 링크 기록. 기록은 목록에 싣지 않고 "자세히"를 열 때만 받아 갑니다.
-  function apiGetSubmission({ res, params }) {
-    const row = store.getSubmissionDetail(Number(params[0]));
-    const assignment = row ? store.getAssignment(row.assignment_id) : null;
+  async function apiGetSubmission({ res, params }) {
+    const row = await store.getSubmissionDetail(Number(params[0]));
+    const assignment = row ? await store.getAssignment(row.assignment_id) : null;
     if (!row || !assignment) throw new HttpError(404, 'not_found', '제출 내역을 찾을 수 없습니다. 이미 삭제되었을 수 있습니다.');
+    const history = await store.listHistory(row.id);
     sendJson(res, 200, {
       submission: {
         ...adminSubmission(row, assignment),
-        history: store.listHistory(row.id).map((entry) => ({
+        history: history.map((entry) => ({
           name: entry.student_name,
           url: entry.url,
           note: entry.note,
@@ -627,28 +631,29 @@ export async function createApp(options = {}) {
     });
   }
 
-  function apiDeleteSubmission({ res, params }) {
-    const submission = store.getSubmissionById(Number(params[0]));
-    if (!submission || !store.deleteSubmission(submission.id)) {
+  async function apiDeleteSubmission({ res, params }) {
+    const submission = await store.getSubmissionById(Number(params[0]));
+    if (!submission || !(await store.deleteSubmission(submission.id))) {
       throw new HttpError(404, 'not_found', '제출 내역을 찾을 수 없습니다. 이미 삭제되었을 수 있습니다.');
     }
     // 지운 제출에 걸려 있던 비밀번호 잠금도 풀어서, 같은 학번으로 바로 다시 낼 수 있게 합니다.
-    limiter.reset(`password:${submission.assignment_id}:${submission.student_id}`);
+    await limiter.reset(`password:${submission.assignment_id}:${submission.student_id}`);
     sendJson(res, 200, { ok: true });
   }
 
-  function apiResetSubmissionPassword({ res, params }) {
-    const submission = store.getSubmissionById(Number(params[0]));
+  async function apiResetSubmissionPassword({ res, params }) {
+    const submission = await store.getSubmissionById(Number(params[0]));
     if (!submission) throw new HttpError(404, 'not_found', '제출 내역을 찾을 수 없습니다. 이미 삭제되었을 수 있습니다.');
-    store.clearSubmissionPassword(submission.id);
-    limiter.reset(`password:${submission.assignment_id}:${submission.student_id}`);
+    await store.clearSubmissionPassword(submission.id);
+    await limiter.reset(`password:${submission.assignment_id}:${submission.student_id}`);
     sendJson(res, 200, { ok: true });
   }
 
-  function apiGetRoster({ res }) {
+  async function apiGetRoster({ res }) {
+    const students = await store.listRoster();
     sendJson(res, 200, {
-      rosterOnly: rosterOnly(),
-      students: store.listRoster().map((row) => ({ studentId: row.student_id, name: row.name })),
+      rosterOnly: await rosterOnly(),
+      students: students.map((row) => ({ studentId: row.student_id, name: row.name })),
     });
   }
 
@@ -656,16 +661,16 @@ export async function createApp(options = {}) {
     const body = await readJson(req, ROSTER_BODY_LIMIT);
     const { students, error } = validateRoster(body.students);
     if (error) throw new HttpError(400, 'invalid', error);
-    store.replaceRoster(students);
-    if (typeof body.rosterOnly === 'boolean') store.setSetting('roster_only', body.rosterOnly ? '1' : '0');
-    sendJson(res, 200, { count: students.length, rosterOnly: rosterOnly() });
+    await store.replaceRoster(students);
+    if (typeof body.rosterOnly === 'boolean') await store.setSetting('roster_only', body.rosterOnly ? '1' : '0');
+    sendJson(res, 200, { count: students.length, rosterOnly: await rosterOnly() });
   }
 
   async function apiPutSettings({ req, res }) {
     const body = await readJson(req, BODY_LIMIT);
     const { value: title, error } = readSiteTitle(body.title);
     if (error) throw invalid({ title: error });
-    store.setSetting('site_title', title);
+    await store.setSetting('site_title', title);
     sendJson(res, 200, { title });
   }
 
@@ -685,8 +690,8 @@ export async function createApp(options = {}) {
     const wrong = '현재 비밀번호가 맞지 않습니다.';
     await requireAdminPassword(req, currentPassword, new HttpError(403, 'wrong_password', wrong, { fields: { currentPassword: wrong } }));
 
-    store.setSetting('admin_password_hash', await hasher.hash(newPassword));
-    store.deleteOtherSessions(session.tokenHash);
+    await store.setSetting('admin_password_hash', await hasher.hash(newPassword));
+    await store.deleteOtherSessions(session.tokenHash);
     sendJson(res, 200, { ok: true });
   }
 
@@ -772,17 +777,17 @@ export async function createApp(options = {}) {
 
   // 만료된 횟수 기록과 로그인을 가끔 치웁니다. 타이머 없이 요청이 올 때 처리해서 어떤 실행 환경에서도 같게 동작합니다.
   let lastCleanup = now().getTime();
-  function cleanUp() {
+  async function cleanUp() {
     const at = now();
     if (at.getTime() - lastCleanup < 60 * 1000) return;
     lastCleanup = at.getTime();
-    limiter.prune();
-    store.pruneSessions(at.toISOString());
+    await limiter.prune();
+    await store.pruneSessions(at.toISOString());
   }
 
   async function handle(req, res) {
     try {
-      cleanUp();
+      await cleanUp();
       await route(req, res);
     } catch (error) {
       if (res.headersSent || res.destroyed) {
