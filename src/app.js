@@ -20,6 +20,8 @@ import {
 } from './security.js';
 import {
   LIMITS,
+  nameKey,
+  readName,
   readSiteTitle,
   readStudentId,
   singleLine,
@@ -57,6 +59,15 @@ const CONTENT_SECURITY_POLICY =
 
 const ALREADY_SUBMITTED =
   '이 학번으로 이미 제출된 링크가 있습니다. 처음 제출할 때 정한 비밀번호를 입력해야 고칠 수 있습니다. 비밀번호가 기억나지 않으면 선생님께 말씀드리세요.';
+const ALREADY_SUBMITTED_BY_NAME =
+  '이 이름으로 이미 제출된 링크가 있습니다. 본인이 낸 것이라면 처음 제출할 때 정한 비밀번호를 입력해야 고칠 수 있습니다(기억나지 않으면 선생님께 말씀드리세요). 이름이 같은 다른 사람이 먼저 냈다면 학번을 함께 적거나 이름 뒤에 숫자를 붙여 구분해 주세요.';
+
+// 한 과제 안에서 제출을 구분하는 값. submissions.student_id 에 이 값이 들어갑니다.
+// 학번을 적었으면 학번이고, 학번 없이 낸 제출(학번을 꼭 받지 않는 과제)은 "~이름" 입니다. 이름은 띄어쓰기와 대소문자를 무시합니다.
+// 학번은 글자나 숫자로 시작해야 하므로 "~" 로 시작하는 값과 겹치지 않습니다. 이름을 학번처럼 적어 남의 자리를 차지할 수도 없습니다.
+const NAME_KEY_MARK = '~';
+const submissionKey = (studentId, name) => studentId || NAME_KEY_MARK + nameKey(name);
+const isNameKey = (key) => key.startsWith(NAME_KEY_MARK);
 
 export class ConfigError extends Error {}
 
@@ -193,6 +204,7 @@ function publicAssignment(assignment, at) {
     description: assignment.description,
     dueAt: assignment.due_at,
     allowLate: Boolean(assignment.allow_late),
+    requireStudentId: Boolean(assignment.require_student_id),
     state: assignmentState(assignment, at),
   };
 }
@@ -201,13 +213,14 @@ function adminAssignment(assignment, at) {
   return { id: assignment.id, isOpen: Boolean(assignment.is_open), createdAt: assignment.created_at, ...publicAssignment(assignment, at) };
 }
 
-function adminSubmission(row, assignment) {
-  return { id: row.id, ...publicSubmission(row, assignment), hasPassword: row.password_hash !== '', rosterName: row.roster_name ?? null };
+function adminSubmission(row, assignment, rosterName = row.roster_name ?? null) {
+  return { id: row.id, ...publicSubmission(row, assignment), hasPassword: row.password_hash !== '', rosterName };
 }
 
 function publicSubmission(row, assignment) {
   return {
-    studentId: row.student_id,
+    // 학번 없이 낸 제출은 학번 자리가 비어 있습니다.
+    studentId: isNameKey(row.student_id) ? '' : row.student_id,
     name: row.student_name,
     url: row.url,
     note: row.note,
@@ -354,10 +367,13 @@ export async function createApp(options = {}) {
   }
 
   // 시도 횟수를 먼저 세고 나서 확인합니다. 동시에 여러 번 찔러 보는 것을 막기 위해서입니다.
-  async function requireStudentPassword(assignmentId, studentId, password, storedHash, wrongMessage) {
-    const key = `password:${assignmentId}:${studentId}`;
+  // submitter 는 제출을 구분하는 값(submissionKey)입니다.
+  async function requireStudentPassword(assignmentId, submitter, password, storedHash, wrongMessage) {
+    const key = `password:${assignmentId}:${submitter}`;
     const gate = await limiter.take(key, PASSWORD_ATTEMPTS, ATTEMPT_WINDOW_MS);
-    if (!gate.allowed) throw tooMany(gate.retryAfter, '비밀번호를 여러 번 틀려서 이 학번의 제출이 잠시 막혔습니다.');
+    if (!gate.allowed) {
+      throw tooMany(gate.retryAfter, `비밀번호를 여러 번 틀려서 이 ${isNameKey(submitter) ? '이름' : '학번'}의 제출이 잠시 막혔습니다.`);
+    }
     if (!(await hasher.verify(password, storedHash))) {
       throw new HttpError(403, 'wrong_password', wrongMessage, { fields: { password: wrongMessage } });
     }
@@ -383,6 +399,11 @@ export async function createApp(options = {}) {
     const assignment = await store.getAssignmentBySlug(slug);
     if (!assignment) throw new HttpError(404, 'not_found', '과제를 찾을 수 없습니다.');
     return assignment;
+  }
+
+  async function isNameInRoster(name) {
+    const key = nameKey(name);
+    return (await store.listRoster()).some((student) => nameKey(student.name) === key);
   }
 
   async function findAssignment(id) {
@@ -435,25 +456,35 @@ export async function createApp(options = {}) {
   async function apiSubmit({ req, res, params }) {
     await throttlePosts(req);
     await findAssignmentBySlug(params[0]);
-    const { value, errors } = validateSubmission(await readJson(req, BODY_LIMIT));
-    if (errors) throw invalid(errors);
+    const body = await readJson(req, BODY_LIMIT);
 
-    // 본문을 받는 동안 선생님이 과제를 닫거나 지웠을 수 있으므로, 과제는 본문을 다 받은 뒤에 읽습니다.
+    // 본문을 받는 동안 선생님이 과제를 닫거나 지우거나 설정을 바꿨을 수 있으므로, 과제는 본문을 다 받은 뒤에 읽습니다.
     // 마감과 지각도 이 시각으로 판단합니다.
     const assignment = await findAssignmentBySlug(params[0]);
+    const { value, errors } = validateSubmission(body, { requireStudentId: Boolean(assignment.require_student_id) });
+    if (errors) throw invalid(errors);
     const at = now();
     if (assignmentState(assignment, at) === 'closed') {
       throw new HttpError(403, 'closed', '이 과제는 제출이 마감되었습니다.');
     }
 
-    const existing = await store.getSubmission(assignment.id, value.studentId);
-    // "명단에 있는 학번만 받기"를 켜 두면 학번 오타나 장난 제출을 처음부터 막습니다.
-    if (!existing && (await rosterOnly()) && (await store.rosterCount()) > 0 && !(await store.isInRoster(value.studentId))) {
-      throw invalid({ studentId: '명단에 없는 학번입니다. 학번을 다시 확인하고, 맞게 썼다면 선생님께 말씀드리세요.' });
+    // 학번을 적었으면 학번으로, 비워 두었으면 이름으로 같은 사람의 제출을 찾습니다.
+    const submitter = submissionKey(value.studentId, value.name);
+    const existing = await store.getSubmission(assignment.id, submitter);
+    // "명단에 있는 학번만 받기"를 켜 두면 학번 오타나 장난 제출을 처음부터 막습니다. 학번 없이 내는 제출은 이름이 명단에 있어야 합니다.
+    if (!existing && (await rosterOnly()) && (await store.rosterCount()) > 0) {
+      if (value.studentId) {
+        if (!(await store.isInRoster(value.studentId))) {
+          throw invalid({ studentId: '명단에 없는 학번입니다. 학번을 다시 확인하고, 맞게 썼다면 선생님께 말씀드리세요.' });
+        }
+      } else if (!(await isNameInRoster(value.name))) {
+        throw invalid({ name: '명단에 없는 이름입니다. 이름을 다시 확인하고, 맞게 썼다면 선생님께 말씀드리세요.' });
+      }
     }
     let passwordHash;
     if (existing && existing.password_hash) {
-      await requireStudentPassword(assignment.id, value.studentId, value.password, existing.password_hash, ALREADY_SUBMITTED);
+      const wrongMessage = value.studentId ? ALREADY_SUBMITTED : ALREADY_SUBMITTED_BY_NAME;
+      await requireStudentPassword(assignment.id, submitter, value.password, existing.password_hash, wrongMessage);
       passwordHash = existing.password_hash;
     } else {
       passwordHash = await hasher.hash(value.password);
@@ -461,7 +492,7 @@ export async function createApp(options = {}) {
 
     const saved = await store.saveSubmission({
       assignmentId: assignment.id,
-      studentId: value.studentId,
+      studentId: submitter,
       name: value.name,
       url: value.url,
       note: value.note,
@@ -492,20 +523,35 @@ export async function createApp(options = {}) {
     const assignment = await findAssignmentBySlug(params[0]);
     const body = await readJson(req, BODY_LIMIT);
 
+    // 학번으로 찾고, 학번을 꼭 받지 않는 과제에서는 학번 없이 이름으로 낸 제출도 찾습니다.
+    const byNameToo = !assignment.require_student_id;
+    const submitters = [];
+    const studentId = readStudentId(body.studentId);
+    if (!studentId.error) submitters.push(studentId.value);
+    if (byNameToo) {
+      const name = readName(body.name);
+      if (!name.error) submitters.push(submissionKey('', name.value));
+    }
+
     const fields = {};
-    const { value: studentId, error: studentIdError } = readStudentId(body.studentId);
-    if (studentIdError) fields.studentId = studentIdError;
+    if (!submitters.length) fields.studentId = byNameToo ? '학번이나 이름을 입력하세요.' : studentId.error;
     const password = typeof body.password === 'string' ? body.password : '';
     if (!password) fields.password = '비밀번호를 입력하세요.';
     else if (password.length > LIMITS.passwordMax) fields.password = '비밀번호가 맞지 않습니다.';
     if (Object.keys(fields).length) throw invalid(fields);
 
-    const existing = await store.getSubmission(assignment.id, studentId);
-    if (!existing) throw new HttpError(404, 'no_submission', '이 학번으로 제출된 링크가 없습니다.');
+    let existing = null;
+    for (const submitter of submitters) {
+      existing = await store.getSubmission(assignment.id, submitter);
+      if (existing) break;
+    }
+    if (!existing) {
+      throw new HttpError(404, 'no_submission', byNameToo ? '이 학번이나 이름으로 제출된 링크가 없습니다.' : '이 학번으로 제출된 링크가 없습니다.');
+    }
     if (!existing.password_hash) {
       throw new HttpError(403, 'password_reset', '선생님이 비밀번호를 초기화했습니다. 링크를 다시 제출하면서 새 비밀번호를 정하세요.');
     }
-    await requireStudentPassword(assignment.id, studentId, password, existing.password_hash, '비밀번호가 맞지 않습니다.');
+    await requireStudentPassword(assignment.id, existing.student_id, password, existing.password_hash, '비밀번호가 맞지 않습니다.');
     sendJson(res, 200, { submission: publicSubmission(existing, assignment) });
   }
 
@@ -587,8 +633,11 @@ export async function createApp(options = {}) {
 
   async function apiUpdateAssignment({ req, res, params }) {
     const existing = await findAssignment(params[0]);
-    const { value, errors } = validateAssignment(await readJson(req, BODY_LIMIT));
+    const body = await readJson(req, BODY_LIMIT);
+    const { value, errors } = validateAssignment(body);
     if (errors) throw invalid(errors);
+    // 이 항목을 보내지 않는 요청(이 기능이 생기기 전에 열어 둔 관리 화면)은 지금 설정을 그대로 둡니다.
+    if (typeof body.requireStudentId !== 'boolean') value.requireStudentId = Boolean(existing.require_student_id);
     sendJson(res, 200, { assignment: adminAssignment(await store.updateAssignment(existing.id, value), now()) });
   }
 
@@ -602,11 +651,31 @@ export async function createApp(options = {}) {
     const assignment = await findAssignment(params[0]);
     const rosterCount = await store.rosterCount();
     const submissions = await store.listSubmissions(assignment.id);
-    const missing = rosterCount ? await store.missingStudents(assignment.id) : [];
+    let missing = rosterCount ? await store.missingStudents(assignment.id) : [];
+
+    // 학번 없이 낸 제출은 이름으로 명단과 맞춰 봅니다.
+    // 명단에 그 이름이 한 명뿐이면 그 학생이 낸 것으로 보고 미제출자에서 뺍니다. 이름이 같은 학생이 여럿이면 누구인지 알 수 없어 그대로 둡니다.
+    const rosterNames = new Map();
+    if (rosterCount && submissions.some((row) => isNameKey(row.student_id))) {
+      const sameName = new Map();
+      for (const student of await store.listRoster()) {
+        const key = NAME_KEY_MARK + nameKey(student.name);
+        sameName.set(key, [...(sameName.get(key) ?? []), student]);
+      }
+      const submitted = new Set();
+      for (const row of submissions) {
+        const students = sameName.get(row.student_id);
+        if (!students) continue;
+        rosterNames.set(row.id, students[0].name);
+        if (students.length === 1) submitted.add(students[0].student_id);
+      }
+      missing = missing.filter((student) => !submitted.has(student.student_id));
+    }
+
     sendJson(res, 200, {
       assignment: adminAssignment(assignment, now()),
       rosterCount,
-      submissions: submissions.map((row) => adminSubmission(row, assignment)),
+      submissions: submissions.map((row) => adminSubmission(row, assignment, rosterNames.get(row.id) ?? row.roster_name ?? null)),
       missing: missing.map((row) => ({ studentId: row.student_id, name: row.name })),
     });
   }

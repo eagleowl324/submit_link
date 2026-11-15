@@ -1,7 +1,7 @@
 // 학생 화면: 과제 목록(/)과 과제별 제출 화면(/a/주소)
 
-import { api, dueBadge, dueText, externalLink, field, formatDateTime, h, richText } from './ui.js';
-import { LIMITS, checkStudentId, normalizeStudentId, validateSubmission } from './shared/rules.js';
+import { api, dueBadge, dueText, externalLink, field, fill, formatDateTime, h, richText } from './ui.js';
+import { LIMITS, checkStudentId, normalizeName, normalizeStudentId, validateSubmission } from './shared/rules.js';
 
 const app = document.getElementById('app');
 const slug = /^\/a\/([a-z0-9]+)\/?$/.exec(location.pathname)?.[1] ?? null;
@@ -44,7 +44,8 @@ function badgeChip(assignment) {
 }
 
 function showProblem(title, message) {
-  app.replaceChildren(
+  fill(
+    app,
     h('div', { class: 'problem' }, h('h1', { class: 'page-title' }, title), h('p', {}, message), h('a', { class: 'button button-secondary', href: '/' }, '과제 목록으로')),
   );
 }
@@ -70,14 +71,18 @@ function showList(site) {
       )
     : h('p', { class: 'empty' }, '아직 올라온 과제가 없습니다. 선생님이 과제를 올리면 여기에 나타납니다.');
 
-  app.replaceChildren(siteHead(site, false), h('h1', { class: 'page-title' }, '제출할 과제를 고르세요'), list);
+  fill(app, siteHead(site, false), h('h1', { class: 'page-title' }, '제출할 과제를 고르세요'), list);
 }
 
 function showAssignment(site, assignment) {
   document.title = `${assignment.title} · ${site.title}`;
 
+  // 학번을 꼭 받지 않는 과제에서는 학번을 비워 두고 낼 수 있고, 그런 제출은 이름으로 구분합니다.
+  const idOptional = assignment.requireStudentId === false;
+
   const stage = h('div', { class: 'stage' });
-  app.replaceChildren(
+  fill(
+    app,
     siteHead(site, true),
     h(
       'div',
@@ -98,7 +103,8 @@ function showAssignment(site, assignment) {
   else showForm();
 
   function showClosed() {
-    stage.replaceChildren(
+    fill(
+      stage,
       h('p', { class: 'notice notice-closed', role: 'status' }, '제출이 마감되었습니다. 새로 내거나 고칠 수 없습니다.'),
       lookupBlock(true),
     );
@@ -108,6 +114,8 @@ function showAssignment(site, assignment) {
     const studentId = field({
       id: 'studentId',
       label: '학번',
+      optional: idOptional,
+      hint: idOptional ? '없으면 비워 두세요.' : null,
       control: h('input', {
         class: 'input',
         id: 'studentId',
@@ -206,7 +214,7 @@ function showAssignment(site, assignment) {
             note: note.input.value,
             password: passwordInput.value,
           });
-          const { value, errors } = validateSubmission(draft);
+          const { value, errors } = validateSubmission(draft, { requireStudentId: !idOptional });
           if (errors) {
             showErrors(errors);
             return;
@@ -216,7 +224,8 @@ function showAssignment(site, assignment) {
           submit.textContent = '제출하는 중…';
           try {
             const result = await api('POST', `${endpoint}/submissions`, value);
-            remember({ studentId: value.studentId, name: value.name });
+            // 학번 없이 냈을 때는 전에 기억해 둔 학번을 지우지 않습니다.
+            remember({ studentId: value.studentId || recall().studentId, name: value.name });
             Object.assign(draft, value);
             showReceipt(result.submission, result.status);
           } catch (error) {
@@ -256,22 +265,24 @@ function showAssignment(site, assignment) {
       first?.focus();
     }
 
-    stage.replaceChildren(form, lookupBlock(false));
+    fill(stage, form, lookupBlock(false));
   }
 
   // 이미 낸 학생이 학번과 비밀번호로 자기 제출을 다시 확인합니다.
+  // 학번을 꼭 받지 않는 과제에서는 학번 없이 낸 사람이 이름으로 찾을 수 있게 한 칸에서 둘 다 받습니다.
   function lookupBlock(open) {
     const studentId = field({
       id: 'lookupStudentId',
-      label: '학번',
+      label: idOptional ? '학번 또는 이름' : '학번',
+      hint: idOptional ? '낼 때 학번을 적었으면 학번, 비워 두었으면 이름을 입력하세요.' : null,
       control: h('input', {
         class: 'input',
         id: 'lookupStudentId',
         autocomplete: 'off',
-        autocapitalize: 'characters',
+        autocapitalize: idOptional ? 'off' : 'characters',
         spellcheck: 'false',
-        maxlength: LIMITS.studentId,
-        value: draft.studentId,
+        maxlength: idOptional ? LIMITS.name : LIMITS.studentId,
+        value: draft.studentId || (idOptional ? draft.name : ''),
       }),
     });
     const password = field({
@@ -294,10 +305,11 @@ function showAssignment(site, assignment) {
           password.setError('');
           message.hidden = true;
 
-          const id = normalizeStudentId(studentId.input.value);
-          const idError = checkStudentId(id);
-          if (idError) {
-            studentId.setError(idError);
+          // 서버는 학번으로 먼저 찾고, 없으면(학번을 꼭 받지 않는 과제에서) 이름으로 찾습니다.
+          const who = idOptional ? normalizeName(studentId.input.value) : normalizeStudentId(studentId.input.value);
+          const whoError = idOptional ? (who ? null : '학번이나 이름을 입력하세요.') : checkStudentId(who);
+          if (whoError) {
+            studentId.setError(whoError);
             studentId.input.focus();
             return;
           }
@@ -309,7 +321,11 @@ function showAssignment(site, assignment) {
 
           button.disabled = true;
           try {
-            const result = await api('POST', `${endpoint}/lookup`, { studentId: id, password: password.input.value });
+            const result = await api('POST', `${endpoint}/lookup`, {
+              studentId: who,
+              ...(idOptional ? { name: who } : {}),
+              password: password.input.value,
+            });
             const found = result.submission;
             Object.assign(draft, { studentId: found.studentId, name: found.name, url: found.url, note: found.note, password: password.input.value });
             showReceipt(found, 'found');
@@ -344,7 +360,8 @@ function showAssignment(site, assignment) {
     const title = h('h2', { class: 'receipt-title', tabindex: '-1' }, headline);
     const editable = assignment.state !== 'closed';
 
-    stage.replaceChildren(
+    fill(
+      stage,
       h(
         'section',
         { class: 'card receipt', 'aria-label': '접수증' },
@@ -357,8 +374,7 @@ function showAssignment(site, assignment) {
         h(
           'dl',
           { class: 'receipt-rows' },
-          h('dt', {}, '학번'),
-          h('dd', { class: 'tabular' }, submission.studentId),
+          submission.studentId ? [h('dt', {}, '학번'), h('dd', { class: 'tabular' }, submission.studentId)] : null,
           h('dt', {}, '이름'),
           h('dd', {}, submission.name),
           h('dt', {}, '링크'),
@@ -377,7 +393,7 @@ function showAssignment(site, assignment) {
           'p',
           { class: 'receipt-advice' },
           '위 링크를 눌러 잘 열리는지 꼭 확인하세요.',
-          editable ? ' 고치려면 같은 학번과 비밀번호로 다시 제출하면 됩니다.' : '',
+          editable ? ` 고치려면 같은 ${submission.studentId ? '학번' : '이름'}과 비밀번호로 다시 제출하면 됩니다.` : '',
         ),
         h(
           'div',
@@ -396,7 +412,8 @@ async function start() {
   try {
     site = await api('GET', '/api/site');
   } catch (error) {
-    app.replaceChildren(
+    fill(
+      app,
       h('div', { class: 'problem' }, h('h1', { class: 'page-title' }, '페이지를 불러오지 못했습니다'), h('p', {}, error.message), h('button', { class: 'button button-secondary', type: 'button', onclick: () => location.reload() }, '다시 불러오기')),
     );
     return;

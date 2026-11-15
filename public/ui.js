@@ -17,6 +17,12 @@ export function h(tag, props, ...children) {
   return element;
 }
 
+// 요소의 내용을 통째로 바꿉니다. h() 처럼 null·false 인 항목은 건너뜁니다.
+// element.replaceChildren() 을 직접 부르면 null 이 "null" 이라는 글자로 화면에 찍히므로, 항상 이 함수를 씁니다.
+export function fill(element, ...children) {
+  element.replaceChildren(...children.flat(Infinity).filter((child) => child !== null && child !== undefined && child !== false));
+}
+
 export class ApiError extends Error {
   constructor(status, body) {
     super(body?.error?.message || '요청을 처리하지 못했습니다. 잠시 뒤 다시 시도해 주세요.');

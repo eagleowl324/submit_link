@@ -5,6 +5,8 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
+import { DatabaseSync } from 'node:sqlite';
+
 import { isProxyPeer, rateKey } from '../src/app.js';
 import { logoutAll, resetAdminPassword } from '../src/node.js';
 import { USING_LIBSQL, createApp } from './support.js';
@@ -174,7 +176,7 @@ test('과제 만들기·고치기·지우기', async (t) => {
 
   const site = await request('GET', '/api/site');
   assert.deepEqual(site.json.assignments, [
-    { slug: created.slug, title: '1차 과제', description: '링크를 내세요', dueAt: '2026-11-20T14:59:00.000Z', allowLate: true, state: 'open' },
+    { slug: created.slug, title: '1차 과제', description: '링크를 내세요', dueAt: '2026-11-20T14:59:00.000Z', allowLate: true, requireStudentId: true, state: 'open' },
   ]);
 
   const updated = await request('PUT', `/api/admin/assignments/${created.id}`, {
@@ -437,6 +439,197 @@ test('"명단에 있는 학번만 받기"를 켜면 명단 밖 학번은 새로 
   assert.equal((await request('PUT', '/api/admin/roster', { cookie, body: { students } })).json.rosterOnly, true);
   await request('PUT', '/api/admin/roster', { cookie, body: { students: [] } });
   assert.equal((await submit(assignment.slug, { studentId: '20310', name: '임소율' })).status, 201);
+});
+
+test('학번 필수 입력은 과제마다 켜고 끌 수 있고, 따로 보내지 않은 수정 요청은 설정을 바꾸지 않는다', async (t) => {
+  const { request, login, createAssignment } = await start(t);
+  const cookie = await login();
+
+  const byDefault = await createAssignment(cookie);
+  assert.equal(byDefault.requireStudentId, true, '따로 정하지 않으면 학번을 받는다');
+  const optional = await createAssignment(cookie, { title: '학번 없이', requireStudentId: false });
+  assert.equal(optional.requireStudentId, false);
+
+  const site = await request('GET', '/api/site');
+  assert.deepEqual(Object.fromEntries(site.json.assignments.map((a) => [a.title, a.requireStudentId])), { '1차 과제': true, '학번 없이': false });
+
+  // 이 항목이 생기기 전에 열어 둔 관리 화면은 이 값을 보내지 않는다. 그런 요청으로 제출을 닫아도 설정은 그대로다.
+  const closed = await request('PUT', `/api/admin/assignments/${optional.id}`, { cookie, body: { title: '학번 없이', isOpen: false } });
+  assert.equal(closed.json.assignment.isOpen, false);
+  assert.equal(closed.json.assignment.requireStudentId, false);
+
+  const turnedOn = await request('PUT', `/api/admin/assignments/${optional.id}`, { cookie, body: { title: '학번 없이', requireStudentId: true } });
+  assert.equal(turnedOn.json.assignment.requireStudentId, true);
+  const overview = await request('GET', '/api/admin/overview', { cookie });
+  assert.deepEqual(overview.json.assignments.map((a) => a.requireStudentId), [true, true]);
+});
+
+test('학번을 꼭 받지 않는 과제: 학번 없이 낸 제출은 이름으로 구분한다', async (t) => {
+  const { request, login, createAssignment, submit } = await start(t);
+  const cookie = await login();
+  const strict = await createAssignment(cookie, { title: '학번 필수' });
+  const loose = await createAssignment(cookie, { title: '학번 선택', requireStudentId: false });
+
+  // 학번을 받는 과제는 지금까지처럼 비워 둘 수 없다.
+  const refused = await submit(strict.slug, { studentId: '' });
+  assert.equal(refused.status, 400);
+  assert.ok(refused.json.error.fields.studentId);
+
+  const first = await submit(loose.slug, { studentId: '', name: '홍길동', url: 'https://example.com/v1' });
+  assert.equal(first.status, 201, first.text);
+  assert.equal(first.json.submission.studentId, '');
+  assert.equal(first.json.submission.name, '홍길동');
+  assert.equal(first.text.includes('~'), false, '구분하는 데 쓰는 값은 응답에 나오지 않는다');
+
+  // 같은 이름으로 다시 내면(띄어쓰기가 달라도) 같은 사람의 제출이다. 비밀번호가 맞아야 고칠 수 있다.
+  const wrong = await submit(loose.slug, { studentId: '', name: '홍 길동', url: 'https://example.com/x', password: 'guess-0000' });
+  assert.equal(wrong.status, 403);
+  assert.match(wrong.json.error.fields.password, /이 이름으로 이미 제출된/);
+  const edited = await submit(loose.slug, { studentId: '', name: '홍 길동', url: 'https://example.com/v2' });
+  assert.equal(edited.status, 200);
+  assert.equal(edited.json.status, 'updated');
+  assert.equal(edited.json.submission.revision, 2);
+  assert.equal(edited.json.submission.name, '홍 길동');
+
+  // 학번을 적은 사람은 학번으로 구분한다. 이름이 같아도 다른 사람이다.
+  const withId = await submit(loose.slug, { studentId: '20301', name: '홍길동', password: 'other-pass' });
+  assert.equal(withId.status, 201);
+  assert.equal(withId.json.submission.studentId, '20301');
+
+  // 이름 칸에 남의 학번을 적어 그 학번의 자리를 차지할 수 없다.
+  assert.equal((await submit(loose.slug, { studentId: '', name: '20302', password: 'squat-pass' })).status, 201);
+  assert.equal((await submit(loose.slug, { studentId: '20302', name: '이도윤', password: 'mine-pass' })).status, 201);
+
+  // 적은 학번이 잘못됐으면 여전히 거절한다.
+  const bad = await submit(loose.slug, { studentId: '!!', name: '임소율' });
+  assert.equal(bad.status, 400);
+  assert.ok(bad.json.error.fields.studentId);
+
+  const list = await request('GET', `/api/admin/assignments/${loose.id}/submissions`, { cookie });
+  assert.deepEqual(
+    list.json.submissions.map((s) => `${s.studentId}|${s.name}`).sort(),
+    ['20301|홍길동', '20302|이도윤', '|20302', '|홍 길동'].sort(),
+  );
+  assert.equal(list.text.includes('~'), false);
+
+  // 여러 번 틀리면 그 이름만 잠긴다.
+  for (let i = 0; i < 8; i += 1) {
+    assert.equal((await submit(loose.slug, { studentId: '', name: '홍길동', password: `wrong-${i}` })).status, 403);
+  }
+  const locked = await submit(loose.slug, { studentId: '', name: '홍길동' });
+  assert.equal(locked.status, 429);
+  assert.match(locked.json.error.message, /이 이름의 제출/);
+  assert.equal((await submit(loose.slug, { studentId: '20301', name: '홍길동', password: 'other-pass' })).status, 200, '같은 이름이라도 학번으로 낸 사람은 영향을 받지 않는다');
+
+  // 선생님이 지우면 잠금도 풀려서 같은 이름으로 처음부터 다시 낼 수 있다.
+  const row = list.json.submissions.find((s) => s.name === '홍 길동');
+  assert.equal((await request('DELETE', `/api/admin/submissions/${row.id}`, { cookie })).status, 200);
+  assert.equal((await submit(loose.slug, { studentId: '', name: '홍길동', password: 'fresh-pass' })).status, 201);
+});
+
+test('학번을 꼭 받지 않는 과제: 제출 확인은 학번으로도 이름으로도 한다', async (t) => {
+  const { request, login, createAssignment, submit } = await start(t);
+  const cookie = await login();
+  const strict = await createAssignment(cookie, { title: '학번 필수' });
+  const loose = await createAssignment(cookie, { title: '학번 선택', requireStudentId: false });
+  const lookup = (slug, body) => request('POST', `/api/assignments/${slug}/lookup`, { body });
+
+  await submit(loose.slug, { studentId: '', name: '홍길동', url: 'https://example.com/hong' });
+  await submit(loose.slug, { studentId: '20302', name: '이도윤', url: 'https://example.com/lee', password: 'pass5678' });
+
+  // 화면은 한 칸에 적은 글을 학번과 이름 양쪽으로 보낸다. 학번으로 먼저 찾고, 없으면 이름으로 찾는다.
+  const byName = await lookup(loose.slug, { studentId: '홍 길동', name: '홍 길동', password: 'pass1234' });
+  assert.equal(byName.status, 200, byName.text);
+  assert.equal(byName.json.submission.url, 'https://example.com/hong');
+  assert.equal(byName.json.submission.studentId, '');
+  const byId = await lookup(loose.slug, { studentId: '20302', name: '20302', password: 'pass5678' });
+  assert.equal(byId.status, 200);
+  assert.equal(byId.json.submission.name, '이도윤');
+  assert.equal((await lookup(loose.slug, { name: '홍길동', password: 'pass1234' })).status, 200, '이름만 보내도 된다');
+
+  // 학번으로 낸 사람을 이름으로 찾지는 않는다. (같은 이름의 다른 사람일 수 있다)
+  assert.equal((await lookup(loose.slug, { studentId: '이도윤', name: '이도윤', password: 'pass5678' })).status, 404);
+
+  const wrong = await lookup(loose.slug, { name: '홍길동', password: 'nope' });
+  assert.equal(wrong.status, 403);
+  assert.equal(wrong.json.error.code, 'wrong_password');
+  const none = await lookup(loose.slug, { studentId: '없는사람', name: '없는사람', password: 'pass1234' });
+  assert.equal(none.status, 404);
+  assert.match(none.json.error.message, /학번이나 이름/);
+  const empty = await lookup(loose.slug, { password: 'pass1234' });
+  assert.equal(empty.status, 400);
+  assert.match(empty.json.error.fields.studentId, /학번이나 이름/);
+
+  // 학번을 받는 과제에서는 이름으로 찾지 않는다.
+  await submit(strict.slug);
+  assert.equal((await lookup(strict.slug, { name: '김하늘', password: 'pass1234' })).status, 400);
+  assert.equal((await lookup(strict.slug, { studentId: '김하늘', name: '김하늘', password: 'pass1234' })).status, 404);
+  assert.equal((await lookup(strict.slug, { studentId: '20301', password: 'pass1234' })).status, 200);
+});
+
+test('학번 없이 낸 제출도 이름으로 명단과 맞춰 본다', async (t) => {
+  const { request, login, createAssignment, submit } = await start(t);
+  const cookie = await login();
+  const assignment = await createAssignment(cookie, { requireStudentId: false });
+  const students = [
+    { studentId: '20301', name: '김하늘' },
+    { studentId: '20302', name: '이도윤' },
+    { studentId: '20303', name: '박서연' },
+    { studentId: '20304', name: '박서연' },
+    { studentId: '20305', name: '최지우' },
+  ];
+  await request('PUT', '/api/admin/roster', { cookie, body: { students } });
+
+  await submit(assignment.slug, { studentId: '', name: '김 하늘' });
+  await submit(assignment.slug, { studentId: '20302', name: '이도윤' });
+  await submit(assignment.slug, { studentId: '', name: '박서연' });
+  await submit(assignment.slug, { studentId: '', name: '전학생' });
+
+  const list = await request('GET', `/api/admin/assignments/${assignment.id}/submissions`, { cookie });
+  assert.deepEqual(
+    list.json.missing,
+    [
+      { studentId: '20303', name: '박서연' },
+      { studentId: '20304', name: '박서연' },
+      { studentId: '20305', name: '최지우' },
+    ],
+    '이름이 한 명뿐이면 낸 것으로 보고, 같은 이름이 여럿이면 누구인지 몰라 그대로 둔다',
+  );
+  assert.deepEqual(
+    Object.fromEntries(list.json.submissions.map((s) => [s.name, [s.studentId, s.rosterName]])),
+    { '김 하늘': ['', '김하늘'], 이도윤: ['20302', '이도윤'], 박서연: ['', '박서연'], 전학생: ['', null] },
+  );
+
+  // "명단에 있는 학번만 받기"를 켜면, 학번 없이 내는 제출은 이름이 명단에 있어야 한다.
+  await request('PUT', '/api/admin/roster', { cookie, body: { students, rosterOnly: true } });
+  const stranger = await submit(assignment.slug, { studentId: '', name: '임소율' });
+  assert.equal(stranger.status, 400);
+  assert.match(stranger.json.error.fields.name, /명단에 없는 이름/);
+  assert.equal((await submit(assignment.slug, { studentId: '', name: '최 지우' })).status, 201);
+  assert.equal((await submit(assignment.slug, { studentId: '99999', name: '최지우' })).status, 400, '적은 학번이 명단에 없으면 받지 않는다');
+  assert.equal((await submit(assignment.slug, { studentId: '', name: '전학생', url: 'https://example.com/v2' })).status, 200, '이미 낸 사람은 계속 고칠 수 있다');
+});
+
+test('이 기능이 생기기 전에 만든 데이터도 그대로 이어 쓴다', async (t) => {
+  const first = await start(t);
+  const assignment = await first.createAssignment(await first.login());
+  await first.submit(assignment.slug);
+  await first.app.close();
+
+  // 데이터 파일을 "학번 필수 입력" 항목이 없던 때의 모양으로 되돌린다.
+  const file = new DatabaseSync(path.join(first.dataDir, 'submissions.db'));
+  file.exec("ALTER TABLE assignments DROP COLUMN require_student_id; UPDATE settings SET value = '1' WHERE key = 'schema_version';");
+  file.close();
+
+  const second = await start(t, { dataDir: first.dataDir, clock: first.clock });
+  const [carried] = (await second.request('GET', '/api/site')).json.assignments;
+  assert.equal(carried.slug, assignment.slug);
+  assert.equal(carried.requireStudentId, true, '전에 만든 과제는 지금까지처럼 학번을 받는다');
+  assert.equal((await second.submit(assignment.slug, { studentId: '' })).status, 400);
+  assert.equal((await second.submit(assignment.slug, { url: 'https://example.com/v2' })).status, 200, '전에 낸 제출도 그대로 고칠 수 있다');
+
+  const optional = await second.createAssignment(await second.login(), { title: '새 과제', requireStudentId: false });
+  assert.equal((await second.submit(optional.slug, { studentId: '' })).status, 201);
 });
 
 test('같은 학번으로 동시에 처음 제출하면 하나만 받아들인다', async (t) => {

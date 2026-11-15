@@ -82,6 +82,10 @@ const MIGRATIONS = [
     reset_at INTEGER NOT NULL
   )
   `,
+
+  // 과제마다 학번을 꼭 받을지 정합니다. 이전에 만든 과제는 지금까지처럼 학번을 받습니다.
+  // 학번 없이 낸 제출은 submissions.student_id 에 "~이름" 을 넣어 구분합니다(src/app.js 의 submissionKey).
+  'ALTER TABLE assignments ADD COLUMN require_student_id INTEGER NOT NULL DEFAULT 1',
 ];
 
 // 모든 시각은 UTC ISO 문자열(2026-11-15T05:03:00.000Z)로 저장해서 문자열 비교가 곧 시간 비교가 됩니다.
@@ -175,28 +179,30 @@ export class Store {
     return (yield get('SELECT * FROM assignments WHERE slug = ?', slug)) ?? null;
   }
 
-  *#createAssignment({ slug, title, description, dueAt, allowLate, isOpen, createdAt }) {
+  *#createAssignment({ slug, title, description, dueAt, allowLate, isOpen, requireStudentId, createdAt }) {
     yield run(
-      'INSERT INTO assignments (slug, title, description, due_at, allow_late, is_open, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      'INSERT INTO assignments (slug, title, description, due_at, allow_late, is_open, require_student_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
       slug,
       title,
       description,
       dueAt,
       allowLate ? 1 : 0,
       isOpen ? 1 : 0,
+      requireStudentId ? 1 : 0,
       createdAt,
     );
     return yield* this.#getAssignmentBySlug(slug);
   }
 
-  *#updateAssignment(id, { title, description, dueAt, allowLate, isOpen }) {
+  *#updateAssignment(id, { title, description, dueAt, allowLate, isOpen, requireStudentId }) {
     yield run(
-      'UPDATE assignments SET title = ?, description = ?, due_at = ?, allow_late = ?, is_open = ? WHERE id = ?',
+      'UPDATE assignments SET title = ?, description = ?, due_at = ?, allow_late = ?, is_open = ?, require_student_id = ? WHERE id = ?',
       title,
       description,
       dueAt,
       allowLate ? 1 : 0,
       isOpen ? 1 : 0,
+      requireStudentId ? 1 : 0,
       id,
     );
     return yield* this.#getAssignment(id);

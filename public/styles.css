@@ -1102,6 +1102,12 @@ textarea.input {
   font-weight: 700;
 }
 
+/* 아무도 학번을 적지 않은 과제에서는 학번 열을 감춥니다. */
+.table-no-id .col-id,
+.table-no-id .cell-id {
+  display: none;
+}
+
 .cell-stack {
   display: flex;
   flex-wrap: wrap;
@@ -1196,6 +1202,13 @@ textarea.input {
 
   .cell-actions {
     grid-area: action;
+  }
+
+  .table-no-id tr {
+    grid-template-areas:
+      "name name action"
+      "link link link"
+      "time time time";
   }
 }
 

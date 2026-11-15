@@ -5,6 +5,7 @@ import {
   LIMITS,
   compareStudentIds,
   multiLine,
+  nameKey,
   normalizeStudentId,
   normalizeUrl,
   parseRosterText,
@@ -87,6 +88,30 @@ test('제출 내용 검사: 빠진 항목마다 안내문이 나온다', () => {
   assert.ok(validateSubmission({ studentId: '1', name: '가', url: 'example.com', password: '1234', note: '가'.repeat(LIMITS.note + 1) }).errors.note);
 });
 
+test('학번을 꼭 받지 않는 과제에서는 비워 둔 학번도 받는다', () => {
+  const rest = { name: '홍길동', url: 'https://example.com/a', password: 'pass1234' };
+  assert.ok(validateSubmission({ ...rest, studentId: '' }).errors.studentId, '따로 정하지 않으면 학번은 필수');
+
+  const blank = validateSubmission({ ...rest, studentId: '  ' }, { requireStudentId: false });
+  assert.equal(blank.errors, null);
+  assert.equal(blank.value.studentId, '');
+  assert.equal(validateSubmission(rest, { requireStudentId: false }).errors, null, '학번 항목이 아예 없어도 된다');
+
+  // 적었다면 똑같이 다듬고 검사한다.
+  assert.equal(validateSubmission({ ...rest, studentId: ' ２０３０１ ' }, { requireStudentId: false }).value.studentId, '20301');
+  assert.ok(validateSubmission({ ...rest, studentId: '!!' }, { requireStudentId: false }).errors.studentId);
+  assert.ok(validateSubmission({ ...rest, studentId: ' '.repeat(500) }, { requireStudentId: false }).errors.studentId, '터무니없이 긴 입력은 빈칸뿐이어도 받지 않는다');
+  // 이름은 여전히 필수다. 학번이 없으면 이름으로 구분하기 때문이다.
+  assert.ok(validateSubmission({ ...rest, name: ' ' }, { requireStudentId: false }).errors.name);
+});
+
+test('이름으로 구분할 때는 띄어쓰기·대소문자·전각 차이를 무시한다', () => {
+  assert.equal(nameKey(' 홍 길동 '), '홍길동');
+  assert.equal(nameKey('Hong  Gildong'), nameKey('hong gildong'));
+  assert.equal(nameKey('ＡＢＣ'), 'abc');
+  assert.notEqual(nameKey('홍길동'), nameKey('홍길순'));
+});
+
 test('보이지 않는 제어 문자와 방향 뒤집기 문자는 지운다', () => {
   const { value } = validateSubmission({ studentId: '20\u200B315', name: '김\u202E하늘\u0007', url: 'example.com', password: '1234' });
   assert.equal(value.studentId, '20315');
@@ -122,7 +147,9 @@ test('과제 검사: 제목은 필수, 마감 일시는 시간대가 붙은 값�
     dueAt: '2026-11-20T14:59:00.000Z',
     allowLate: false,
     isOpen: true,
+    requireStudentId: true,
   });
+  assert.equal(validateAssignment({ title: '과제', requireStudentId: false }).value.requireStudentId, false);
   assert.equal(validateAssignment({ title: '과제', dueAt: '' }).value.dueAt, null);
   assert.equal(validateAssignment({ title: '과제', dueAt: null }).value.dueAt, null);
 });

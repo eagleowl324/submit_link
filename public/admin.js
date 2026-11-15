@@ -1,6 +1,6 @@
 // 관리 화면: 과제 만들기, 제출 현황, 미제출자, 명단·설정
 
-import { api, copyText, dueBadge, dueText, externalLink, field, formatDateTime, formatTimestamp, h, richText, toast } from './ui.js';
+import { api, copyText, dueBadge, dueText, externalLink, field, fill, formatDateTime, formatTimestamp, h, richText, toast } from './ui.js';
 import { LIMITS, compareStudentIds, parseRosterText } from './shared/rules.js';
 import { submissionTable, toCsv } from './shared/csv.js';
 
@@ -22,7 +22,14 @@ const state = {
 let refreshTimer = null;
 let syncTicket = 0;
 
-const byStudentId = (a, b) => compareStudentIds(a.studentId, b.studentId);
+// 학번 순서. 학번 없이 낸 제출은 뒤에 이름순으로 모읍니다.
+const byStudentId = (a, b) => {
+  if (Boolean(a.studentId) !== Boolean(b.studentId)) return a.studentId ? -1 : 1;
+  return a.studentId ? compareStudentIds(a.studentId, b.studentId) : a.name.localeCompare(b.name, 'ko');
+};
+
+// 제출한 사람을 가리키는 말: "20301 김하늘", 학번 없이 냈으면 "김하늘"
+const who = (submission) => [submission.studentId, submission.name].filter(Boolean).join(' ');
 
 // ── 서버와 주고받기 ─────────────────────────────────────────────────────────
 
@@ -91,7 +98,7 @@ function render() {
   const active = document.activeElement;
   const focus = active && active.id && app.contains(active) ? { id: active.id, start: active.selectionStart, end: active.selectionEnd } : null;
 
-  app.replaceChildren(topbar(), state.view === 'settings' ? settingsView() : assignmentsView());
+  fill(app, topbar(), state.view === 'settings' ? settingsView() : assignmentsView());
 
   if (focus) {
     const element = document.getElementById(focus.id);
@@ -270,6 +277,7 @@ function panel(detail) {
         h('span', { class: `chip chip-${badge.tone}` }, badge.text),
         h('span', {}, dueText(assignment)),
         latePolicy ? h('span', { class: 'muted' }, `· ${latePolicy}`) : null,
+        !assignment.requireStudentId ? h('span', { class: 'muted' }, '· 학번 없이도 제출 가능') : null,
         !assignment.isOpen ? h('span', { class: 'muted' }, '· 직접 닫음') : null,
       ),
       assignment.description ? h('p', { class: 'description' }, richText(assignment.description)) : null,
@@ -325,7 +333,7 @@ function panel(detail) {
       'aria-label': '정렬 순서',
       onchange: (event) => {
         state.sort = event.target.value;
-        tableHost.replaceChildren(submissionsTable(detail));
+        fill(tableHost, submissionsTable(detail));
       },
     },
     h('option', { value: 'studentId' }, '학번 순'),
@@ -345,7 +353,7 @@ function panel(detail) {
       value: state.query,
       oninput: (event) => {
         state.query = event.target.value;
-        tableHost.replaceChildren(submissionsTable(detail));
+        fill(tableHost, submissionsTable(detail));
       },
     }),
     sort,
@@ -375,12 +383,14 @@ function submissionsTable(detail) {
   if (!rows.length) return h('p', { class: 'empty' }, '찾는 학생이 없습니다.');
 
   const heading = (label, className) => h('th', { class: className, scope: 'col', role: 'columnheader' }, label);
+  // 아무도 학번을 적지 않은 과제에서는 학번 열을 감춥니다.
+  const anyStudentId = detail.submissions.some((submission) => submission.studentId);
   return h(
     'div',
     { class: 'table-wrap' },
     h(
       'table',
-      { class: 'table', role: 'table' },
+      { class: anyStudentId ? 'table' : 'table table-no-id', role: 'table' },
       h(
         'thead',
         { role: 'rowgroup' },
@@ -407,7 +417,7 @@ function submissionRow(submission, detail) {
   return h(
     'tr',
     { role: 'row' },
-    h('td', { class: 'cell-id', role: 'cell' }, submission.studentId),
+    h('td', { class: 'cell-id', role: 'cell' }, submission.studentId || h('span', { class: 'cell-meta', title: '학번 없이 제출' }, '—')),
     h('td', { class: 'cell-name', role: 'cell' }, h('div', { class: 'cell-stack' }, h('span', {}, submission.name), rosterFlag(submission, detail))),
     h('td', { class: 'cell-link', role: 'cell' }, linkCell(submission.url), submission.note ? h('p', { class: 'cell-note' }, submission.note) : null),
     h(
@@ -426,7 +436,7 @@ function submissionRow(submission, detail) {
       'td',
       { class: 'cell-actions', role: 'cell' },
       button('자세히', () => openSubmissionDialog(submission, detail), 'secondary button-small', {
-        'aria-label': `${submission.studentId} ${submission.name} 자세히`,
+        'aria-label': `${who(submission)} 자세히`,
       }),
     ),
   );
@@ -448,7 +458,7 @@ function openSubmissionDialog(submission, detail) {
         )
       : null;
 
-  const dialog = openDialog(`${submission.studentId} ${submission.name}`, [
+  const dialog = openDialog(who(submission), [
     h(
       'dl',
       { class: 'detail-rows' },
@@ -460,7 +470,11 @@ function openSubmissionDialog(submission, detail) {
     ),
     history,
     !submission.hasPassword
-      ? h('p', { class: 'notice notice-late' }, '비밀번호가 초기화되어 있습니다. 이 학번으로 다음에 제출하는 사람이 새 비밀번호를 정합니다.')
+      ? h(
+          'p',
+          { class: 'notice notice-late' },
+          `비밀번호가 초기화되어 있습니다. 이 ${submission.studentId ? '학번' : '이름'}으로 다음에 제출하는 사람이 새 비밀번호를 정합니다.`,
+        )
       : null,
     h(
       'div',
@@ -567,6 +581,7 @@ async function toggleOpen(assignment) {
       description: assignment.description,
       dueAt: assignment.dueAt,
       allowLate: assignment.allowLate,
+      requireStudentId: assignment.requireStudentId,
       isOpen: !assignment.isOpen,
     });
     toast(assignment.isOpen ? '제출을 닫았습니다.' : '다시 제출을 받습니다.');
@@ -597,7 +612,7 @@ async function removeAssignment(assignment, submissionCount) {
 async function removeSubmission(submission, parentDialog) {
   const confirmed = await confirmDialog({
     title: '제출을 삭제할까요?',
-    message: `${submission.studentId} ${submission.name} 학생의 제출과 이전 제출 기록이 지워집니다. 학생은 처음부터 다시 낼 수 있습니다.`,
+    message: `${who(submission)} 학생의 제출과 이전 제출 기록이 지워집니다. 학생은 처음부터 다시 낼 수 있습니다.`,
     confirmLabel: '삭제',
   });
   if (!confirmed) return;
@@ -614,7 +629,7 @@ async function removeSubmission(submission, parentDialog) {
 async function resetPassword(submission, parentDialog) {
   const confirmed = await confirmDialog({
     title: '비밀번호를 초기화할까요?',
-    message: `${submission.studentId} ${submission.name} 학생이 다음에 제출할 때 새 비밀번호를 정하게 됩니다. 제출한 링크는 그대로 남습니다.`,
+    message: `${who(submission)} 학생이 다음에 제출할 때 새 비밀번호를 정하게 됩니다. 제출한 링크는 그대로 남습니다.`,
     confirmLabel: '초기화',
     danger: false,
   });
@@ -698,6 +713,12 @@ function openAssignmentDialog(existing) {
     control: h('input', { class: 'input', id: 'assignment-due', type: 'datetime-local', value: existing?.dueAt ? toLocalInput(existing.dueAt) : '' }),
   });
   const allowLate = h('input', { type: 'checkbox', id: 'assignment-late', checked: existing ? existing.allowLate : true });
+  // 새 과제는 가장 최근에 만든 과제의 설정을 따릅니다. 학번을 받지 않는 수업에서 매번 다시 끄지 않아도 됩니다.
+  const requireStudentId = h('input', {
+    type: 'checkbox',
+    id: 'assignment-student-id',
+    checked: existing ? existing.requireStudentId : (state.overview?.assignments[0]?.requireStudentId ?? true),
+  });
   const message = h('p', { class: 'form-message', role: 'alert', hidden: true });
   const save = h('button', { class: 'button button-primary', type: 'submit' }, existing ? '저장' : '과제 만들기');
   const fields = { title, description, dueAt: due };
@@ -726,6 +747,7 @@ function openAssignmentDialog(existing) {
           description: description.input.value,
           dueAt,
           allowLate: allowLate.checked,
+          requireStudentId: requireStudentId.checked,
           isOpen: existing ? existing.isOpen : true,
         };
 
@@ -763,6 +785,12 @@ function openAssignmentDialog(existing) {
     description.wrap,
     due.wrap,
     h('label', { class: 'check', for: 'assignment-late' }, allowLate, h('span', {}, '마감 뒤에도 제출을 받고 "지각"으로 표시하기')),
+    h(
+      'label',
+      { class: 'check', for: 'assignment-student-id' },
+      requireStudentId,
+      h('span', {}, '학번 필수 입력', h('span', { class: 'check-note' }, '끄면 학번을 비워 두고도 낼 수 있습니다. 학번 없이 낸 제출은 이름으로 구분합니다.')),
+    ),
     message,
     h('div', { class: 'dialog-actions' }, button('취소', () => dialog.close()), save),
   );
@@ -856,8 +884,9 @@ function rosterSettings() {
           const parsed = parseRosterText(roster.input.value);
           if (parsed.problems.length) {
             roster.setError(`읽을 수 없는 줄이 ${parsed.problems.length}개 있습니다. 고친 뒤 다시 저장하세요.`);
-            problems.replaceChildren(
-              ...parsed.problems.slice(0, 8).map((problem) => h('li', {}, `${problem.line}번째 줄 "${problem.text}" — ${problem.reason}`)),
+            fill(
+              problems,
+              parsed.problems.slice(0, 8).map((problem) => h('li', {}, `${problem.line}번째 줄 "${problem.text}" — ${problem.reason}`)),
             );
             problems.hidden = false;
             return;
@@ -883,7 +912,12 @@ function rosterSettings() {
         'label',
         { class: 'check', for: 'roster-only' },
         rosterOnly,
-        h('span', {}, '명단에 있는 학번만 제출 받기', h('span', { class: 'check-note' }, '학번을 잘못 쓴 제출을 막습니다. 명단이 비어 있으면 적용되지 않습니다.')),
+        h(
+          'span',
+          {},
+          '명단에 있는 학번만 제출 받기',
+          h('span', { class: 'check-note' }, '학번을 잘못 쓴 제출을 막습니다. 학번 없이 내는 제출은 이름이 명단에 있어야 받습니다. 명단이 비어 있으면 적용되지 않습니다.'),
+        ),
       ),
       save,
     ),
@@ -979,7 +1013,8 @@ function showLogin(notice) {
   });
   const submit = h('button', { class: 'button button-primary button-block', type: 'submit' }, '로그인');
 
-  app.replaceChildren(
+  fill(
+    app,
     h(
       'main',
       { class: 'login' },
@@ -1030,7 +1065,8 @@ function showSetup() {
   const again = field({ id: 'setup-password-again', label: '한 번 더 입력', control: passwordInput('setup-password-again') });
   const submit = h('button', { class: 'button button-primary button-block', type: 'submit' }, '비밀번호 정하고 시작하기');
 
-  app.replaceChildren(
+  fill(
+    app,
     h(
       'main',
       { class: 'login' },
@@ -1093,7 +1129,8 @@ async function boot() {
     else if (session.needsSetup) showSetup();
     else showLogin();
   } catch (error) {
-    app.replaceChildren(
+    fill(
+      app,
       h(
         'main',
         { class: 'login' },

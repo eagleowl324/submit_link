@@ -74,6 +74,11 @@ export function checkStudentId(studentId) {
 
 export const normalizeName = singleLine;
 
+// 학번 없이 낸 제출은 이름으로 구분합니다. 띄어쓰기나 대소문자, 전각·반각이 달라도 같은 사람으로 봅니다.
+export function nameKey(name) {
+  return normalizeName(name).normalize('NFKC').replace(/\s+/g, '').toLowerCase();
+}
+
 export function checkName(name) {
   if (!name) return '이름을 입력하세요.';
   if (name.length > LIMITS.name) return `이름은 ${LIMITS.name}자까지 쓸 수 있습니다.`;
@@ -110,6 +115,12 @@ export function checkPassword(password) {
 // { value, error } 를 돌려주는 읽기 함수들. 서버는 항상 이쪽을 씁니다.
 export const readStudentId = (raw) => read(raw, LIMITS.studentId, normalizeStudentId, checkStudentId);
 export const readName = (raw) => read(raw, LIMITS.name, normalizeName, checkName);
+
+// 학번을 꼭 받지 않는 과제에서는 비워 둔 학번을 그대로 받습니다. 적었다면 똑같이 검사합니다.
+function readOptionalStudentId(raw) {
+  const studentId = readStudentId(raw);
+  return studentId.value === '' && !oversized(raw, LIMITS.studentId) ? { value: '', error: null } : studentId;
+}
 export const readSiteTitle = (raw) => read(raw, LIMITS.siteTitle, singleLine, checkSiteTitle);
 
 function isLocalAddress(hostname) {
@@ -161,10 +172,11 @@ function result(value, errors) {
   return { value, errors: Object.keys(errors).length ? errors : null };
 }
 
-export function validateSubmission(input) {
+// requireStudentId 가 false 면(과제 설정) 학번을 비워 둔 제출도 받습니다. 그때 value.studentId 는 '' 입니다.
+export function validateSubmission(input, { requireStudentId = true } = {}) {
   const errors = {};
 
-  const studentId = readStudentId(input?.studentId);
+  const studentId = requireStudentId ? readStudentId(input?.studentId) : readOptionalStudentId(input?.studentId);
   if (studentId.error) errors.studentId = studentId.error;
 
   const name = readName(input?.name);
@@ -202,7 +214,14 @@ export function validateAssignment(input) {
   }
 
   return result(
-    { title: title.value, description: description.value, dueAt, allowLate: input?.allowLate !== false, isOpen: input?.isOpen !== false },
+    {
+      title: title.value,
+      description: description.value,
+      dueAt,
+      allowLate: input?.allowLate !== false,
+      isOpen: input?.isOpen !== false,
+      requireStudentId: input?.requireStudentId !== false,
+    },
     errors,
   );
 }

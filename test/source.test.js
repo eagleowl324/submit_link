@@ -52,3 +52,15 @@ test('src/pages.generated.js 가 public/*.html 과 같다 (다르면 npm run bui
   assert.equal(generated.student, readFileSync(path.join(ROOT, 'public', 'index.html'), 'utf8'));
   assert.equal(generated.admin, readFileSync(path.join(ROOT, 'public', 'admin.html'), 'utf8'));
 });
+
+// element.replaceChildren(a, null) 은 null 을 "null" 이라는 글자로 화면에 찍습니다.
+// 그래서 화면 스크립트는 null 을 걸러 주는 fill() (public/ui.js) 만 씁니다.
+test('화면 스크립트는 replaceChildren 을 직접 부르지 않는다', () => {
+  for (const name of readdirSync(path.join(ROOT, 'public'))) {
+    if (!name.endsWith('.js')) continue;
+    const calls = readFileSync(path.join(ROOT, 'public', name), 'utf8')
+      .split('\n')
+      .filter((line) => line.includes('.replaceChildren(') && !line.trim().startsWith('//'));
+    assert.equal(calls.length, name === 'ui.js' ? 1 : 0, `${name}: ${calls.join(' | ')}`);
+  }
+});
