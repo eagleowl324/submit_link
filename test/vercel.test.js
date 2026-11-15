@@ -9,7 +9,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-import { createVercelHandler, findDatabase, originalUrl } from '../src/vercel.js';
+import { createVercelHandler, errorCode, findDatabase, findOtherStorage, originalUrl } from '../src/vercel.js';
 
 const libsql = await import('@libsql/client').catch(() => null);
 const skip = libsql ? false : '@libsql/client 가 설치되어 있지 않습니다. npm install 뒤에 다시 실행하세요.';
@@ -69,6 +69,29 @@ test('환경 변수에서 데이터베이스 주소와 토큰을 찾는다', () 
   // 연결할 때 이름 앞에 다른 말을 붙인 경우
   assert.deepEqual(findDatabase({ SUBMIT_TURSO_DATABASE_URL: 'libsql://b.turso.io', SUBMIT_TURSO_AUTH_TOKEN: 'u' }), { url: 'libsql://b.turso.io', authToken: 'u' });
   assert.deepEqual(findDatabase({ STORAGE_DATABASE_URL: 'libsql://c.turso.io' }), { url: 'libsql://c.turso.io', authToken: undefined });
+  assert.deepEqual(findDatabase({ MY_TURSO_DATABASE_URL: 'https://d.turso.io', MY_TURSO_AUTH_TOKEN: 'v' }), { url: 'https://d.turso.io', authToken: 'v' });
+  assert.equal(findDatabase({ TURSO_DATABASE_URL: '', MY_TURSO_DATABASE_URL: '' }), null);
+});
+
+test('Turso 가 아닌 저장소가 연결되어 있으면 알아본다', () => {
+  assert.equal(findOtherStorage({}), null);
+  assert.equal(findOtherStorage({ VERCEL: '1', VERCEL_URL: 'x.vercel.app', NODE_ENV: 'production', AWS_REGION: 'ap-northeast-1' }), null);
+  assert.equal(findOtherStorage({ POSTGRES_URL: 'postgres://x' }), 'Postgres');
+  assert.equal(findOtherStorage({ DATABASE_URL: 'postgresql://x' }), 'Postgres');
+  assert.equal(findOtherStorage({ KV_REST_API_URL: 'https://x' }), 'Redis');
+  assert.equal(findOtherStorage({ BLOB_READ_WRITE_TOKEN: 'x' }), 'Blob');
+  assert.equal(findOtherStorage({ POSTGRES_URL: '' }), null);
+});
+
+test('오류에서 화면에 보여 줄 짧은 코드만 고른다', () => {
+  assert.equal(errorCode(new Error('boom')), '');
+  assert.equal(errorCode(null), '');
+  assert.equal(errorCode(Object.assign(new Error('x'), { code: 'SERVER_ERROR', cause: { status: 401 } })), 'SERVER_ERROR / 401');
+  assert.equal(errorCode(Object.assign(new TypeError('fetch failed'), { cause: { code: 'ENOTFOUND' } })), 'ENOTFOUND');
+  assert.equal(errorCode(Object.assign(new Error('x'), { code: 'URL_INVALID', cause: { code: 'URL_INVALID' } })), 'URL_INVALID');
+  // 코드처럼 생기지 않은 값(주소, 문장)은 내보내지 않는다
+  assert.equal(errorCode(Object.assign(new Error('x'), { code: 'libsql://secret.turso.io?authToken=abc' })), '');
+  assert.equal(errorCode(Object.assign(new Error('x'), { code: { toString: () => 'OBJECT' } })), '');
 });
 
 test('Vercel 이 주소를 어떻게 넘겨 주든 방문자가 요청한 원래 주소로 처리한다', { skip }, async (t) => {
@@ -120,8 +143,16 @@ test('데이터베이스를 연결하기 전에는 안내문을 보여 준다', 
     assert.equal(response.status, 503, url);
     assert.match(response.text, /데이터베이스를 연결해 주세요/);
     assert.match(response.text, /Storage/);
+    assert.equal(response.text.includes('다른 종류의 저장소'), false);
   }
   assert.equal(created, 0);
+
+  // 다른 종류의 저장소를 연결해 둔 경우에는 그 사실을 알려 준다. 값은 내보내지 않는다.
+  const wrong = createVercelHandler({ env: { POSTGRES_URL: 'postgres://user:secret-password@db.example/x' }, createClient: () => assert.fail() });
+  const response = await call(wrong, 'GET', '/');
+  assert.equal(response.status, 503);
+  assert.match(response.text, /다른 종류의 저장소\(Postgres\)/);
+  assert.equal(response.text.includes('secret-password'), false);
 });
 
 test('데이터베이스에 연결하지 못하면 알리고, 다음 요청에서 다시 시도한다', { skip }, async (t) => {
@@ -130,7 +161,7 @@ test('데이터베이스에 연결하지 못하면 알리고, 다음 요청에�
   const handler = createVercelHandler({
     env: DATABASE_ENV,
     createClient: () => {
-      if (broken) throw new Error('boom: secret-token-value');
+      if (broken) throw Object.assign(new Error('boom: secret-token-value'), { code: 'SERVER_ERROR', cause: { status: 401 } });
       return libsql.createClient({ url: `file:${path.join(folder, 'vercel.db')}` });
     },
     serialize: true,
@@ -145,6 +176,7 @@ test('데이터베이스에 연결하지 못하면 알리고, 다음 요청에�
   assert.equal(failed.status, 500);
   assert.match(failed.text, /서비스를 시작하지 못했습니다/);
   assert.equal(failed.text.includes('secret-token-value'), false, '오류 내용을 화면에 그대로 내보내지 않는다');
+  assert.match(failed.text, /오류 코드: SERVER_ERROR \/ 401/, '원인을 짐작할 수 있는 코드는 보여 준다');
 
   broken = false;
   assert.equal((await call(handler, 'GET', '/')).status, 200);

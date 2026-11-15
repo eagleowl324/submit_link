@@ -18,12 +18,42 @@ import { RateLimiter, StoredBuckets } from './security.js';
 export function findDatabase(env) {
   if (env.TURSO_DATABASE_URL) return { url: env.TURSO_DATABASE_URL, authToken: env.TURSO_AUTH_TOKEN || undefined };
   for (const [name, value] of Object.entries(env)) {
-    if (name.endsWith('DATABASE_URL') && typeof value === 'string' && value.startsWith('libsql://')) {
+    if (!name.endsWith('DATABASE_URL') || typeof value !== 'string' || !value) continue;
+    if (name.endsWith('TURSO_DATABASE_URL') || value.startsWith('libsql://')) {
       const prefix = name.slice(0, -'DATABASE_URL'.length);
       return { url: value, authToken: env[`${prefix}AUTH_TOKEN`] || undefined };
     }
   }
   return null;
+}
+
+// Turso 가 아닌 다른 저장소가 연결되어 있으면 그 종류를 돌려줍니다.
+// Vercel 의 Storage 에서 저장소 종류를 잘못 골랐을 때 안내문에서 알려 주기 위해서입니다.
+const OTHER_STORAGE = [
+  ['Postgres', /^(POSTGRES_|PG(HOST|USER|DATABASE|PASSWORD)$|SUPABASE_|NEON_)/],
+  ['Redis', /^(KV_|REDIS_|UPSTASH_)/],
+  ['MongoDB', /^MONGODB_/],
+  ['Blob', /^BLOB_READ_WRITE_TOKEN$/],
+  ['Edge Config', /^EDGE_CONFIG$/],
+];
+
+export function findOtherStorage(env) {
+  const names = Object.keys(env).filter((name) => env[name]);
+  for (const [kind, pattern] of OTHER_STORAGE) {
+    if (names.some((name) => pattern.test(name))) return kind;
+  }
+  if (names.some((name) => name.endsWith('DATABASE_URL') && /^postgres(ql)?:/.test(String(env[name])))) return 'Postgres';
+  return null;
+}
+
+// 무엇이 잘못됐는지 짐작할 수 있는 짧은 오류 코드만 고릅니다. (예: SERVER_ERROR / 401, ENOTFOUND)
+// 오류 문장에는 데이터베이스 주소나 토큰이 섞여 있을 수 있어서 화면에 내보내지 않습니다.
+export function errorCode(error) {
+  const parts = [error?.code, error?.cause?.code, error?.cause?.status]
+    .filter((part) => typeof part === 'string' || Number.isInteger(part))
+    .map(String)
+    .filter((part) => /^[A-Za-z0-9_]{1,40}$/.test(part));
+  return [...new Set(parts)].join(' / ');
 }
 
 // 방문자가 요청한 원래 주소를 구합니다.
@@ -78,14 +108,21 @@ export function createVercelHandler({ env, createClient, serialize = false }) {
     } catch (error) {
       starting = null;
       console.error(error);
-      const detail = error?.constructor?.name === 'ConfigError' ? error.message : '데이터베이스에 연결하지 못했습니다. Vercel 의 Storage 에서 데이터베이스가 이 프로젝트에 연결되어 있는지 확인해 주세요.';
-      return notice(500, '서비스를 시작하지 못했습니다', [detail]);
+      if (error?.constructor?.name === 'ConfigError') return notice(500, '서비스를 시작하지 못했습니다', [error.message]);
+      const code = errorCode(error);
+      return notice(500, '서비스를 시작하지 못했습니다', [
+        '데이터베이스에 연결하지 못했습니다. Vercel 의 Storage 에서 데이터베이스가 이 프로젝트에 연결되어 있는지 확인해 주세요.',
+        ...(code ? [`오류 코드: ${code}`] : []),
+      ]);
     }
     if (!app) {
       starting = null;
+      const other = findOtherStorage(env);
       return notice(503, '데이터베이스를 연결해 주세요', [
         '제출 내용을 저장할 데이터베이스가 아직 연결되지 않았습니다.',
+        ...(other ? [`지금은 다른 종류의 저장소(${other})가 연결되어 있습니다. 이 서비스는 Turso 데이터베이스에만 저장할 수 있습니다.`] : []),
         'Vercel 프로젝트의 Storage 탭에서 Turso 데이터베이스를 만들어 이 프로젝트에 연결한 다음, Deployments 탭에서 다시 배포(Redeploy)해 주세요.',
+        '연결이 되었다면 프로젝트의 Settings → Environment Variables 에 TURSO_DATABASE_URL 과 TURSO_AUTH_TOKEN 이 보입니다. 연결한 뒤에 새로 배포해야 적용됩니다.',
       ]);
     }
     return serve(app, request, { url: originalUrl(request) });
