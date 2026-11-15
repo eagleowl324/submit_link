@@ -20,7 +20,9 @@ import {
 } from './security.js';
 import {
   LIMITS,
+  checkFile,
   nameKey,
+  normalizeFileName,
   readName,
   readSiteTitle,
   readStudentId,
@@ -47,6 +49,17 @@ const ATTEMPT_WINDOW_MS = 10 * 60 * 1000;
 // 누군가 제출을 끝없이 쌓아 저장 공간과 관리 화면을 망가뜨리는 것을 막는 한도
 const MAX_SUBMISSIONS_PER_ASSIGNMENT = 5000;
 const MAX_LINK_CHANGES = 30;
+
+// 첨부 파일. 파일은 조각으로 나눠 올리고 조각째로 저장합니다(src/db.js 의 file_chunks).
+// 요청 하나에 실을 수 있는 크기가 4.5MB 로 제한된 실행 환경(Vercel)에서도 그보다 큰 파일을 받기 위해서입니다.
+const FILE_CHUNK_BYTES = 512 * 1024;
+// 파일 하나의 크기와, 받아 둘 수 있는 파일 전체의 크기. MAX_FILE_MB, FILE_STORAGE_MB 환경 변수로 바꿉니다.
+const MAX_FILE_BYTES = 10 * 1024 * 1024;
+const FILE_STORAGE_BYTES = 1024 * 1024 * 1024;
+// 다 올리고도 이 시간 안에 제출하지 않은 파일은 지웁니다.
+const UPLOAD_LIFETIME_MS = 60 * 60 * 1000;
+// 한 IP에서 10분 동안 올리기 시작할 수 있는 파일 수 (한 교실이 같은 IP를 씁니다)
+const UPLOAD_STARTS = 120;
 
 const SECURITY_HEADERS = {
   'X-Content-Type-Options': 'nosniff',
@@ -80,6 +93,15 @@ class HttpError extends Error {
   }
 }
 
+// 환경 변수에서 파일 한도를 읽습니다. createApp 의 limits 로 넘깁니다. 값이 없거나 잘못됐으면 기본값을 씁니다.
+export function fileLimitsFromEnv(env) {
+  const megabytes = (value) => {
+    const number = Number(value);
+    return value !== undefined && value !== '' && Number.isFinite(number) && number > 0 ? Math.floor(number * 1024 * 1024) : undefined;
+  };
+  return { maxFileBytes: megabytes(env.MAX_FILE_MB), fileStorageBytes: megabytes(env.FILE_STORAGE_MB) };
+}
+
 function invalid(fields) {
   return new HttpError(400, 'invalid', '입력한 내용을 다시 확인해 주세요.', { fields });
 }
@@ -105,6 +127,19 @@ function readCookie(req, name) {
     if (index !== -1 && part.slice(0, index).trim() === name) return part.slice(index + 1).trim();
   }
   return null;
+}
+
+// JSON 이 아닌 본문(파일 조각)을 읽습니다.
+async function readBytes(req, limit) {
+  if (Number(req.headers['content-length']) > limit) throw new HttpError(413, 'too_large', '보낸 내용이 너무 큽니다.');
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > limit) throw new HttpError(413, 'too_large', '보낸 내용이 너무 큽니다.');
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
 }
 
 async function readJson(req, limit) {
@@ -205,6 +240,7 @@ function publicAssignment(assignment, at) {
     dueAt: assignment.due_at,
     allowLate: Boolean(assignment.allow_late),
     requireStudentId: Boolean(assignment.require_student_id),
+    allowFiles: Boolean(assignment.allow_files),
     state: assignmentState(assignment, at),
   };
 }
@@ -213,8 +249,15 @@ function adminAssignment(assignment, at) {
   return { id: assignment.id, isOpen: Boolean(assignment.is_open), createdAt: assignment.created_at, ...publicAssignment(assignment, at) };
 }
 
+// 관리 화면에는 파일을 내려받는 데 필요한 번호와 조각 수도 줍니다.
 function adminSubmission(row, assignment, rosterName = row.roster_name ?? null) {
-  return { id: row.id, ...publicSubmission(row, assignment), hasPassword: row.password_hash !== '', rosterName };
+  return {
+    id: row.id,
+    ...publicSubmission(row, assignment),
+    file: row.file_id ? { id: row.file_id, name: row.file_name, size: row.file_size, chunks: row.file_chunks } : null,
+    hasPassword: row.password_hash !== '',
+    rosterName,
+  };
 }
 
 function publicSubmission(row, assignment) {
@@ -223,6 +266,7 @@ function publicSubmission(row, assignment) {
     studentId: isNameKey(row.student_id) ? '' : row.student_id,
     name: row.student_name,
     url: row.url,
+    file: row.file_id ? { name: row.file_name, size: row.file_size } : null,
     note: row.note,
     revision: row.revision,
     createdAt: row.created_at,
@@ -268,6 +312,8 @@ export async function createApp(options = {}) {
   } = options;
   const maxSubmissions = limits.maxSubmissions ?? MAX_SUBMISSIONS_PER_ASSIGNMENT;
   const maxLinkChanges = limits.maxLinkChanges ?? MAX_LINK_CHANGES;
+  const maxFileBytes = limits.maxFileBytes ?? MAX_FILE_BYTES;
+  const fileStorageBytes = limits.fileStorageBytes ?? FILE_STORAGE_BYTES;
 
   if (adminPassword && adminPassword.length < LIMITS.adminPasswordMin) {
     throw new ConfigError(`ADMIN_PASSWORD 는 ${LIMITS.adminPasswordMin}자 이상이어야 합니다.`);
@@ -450,7 +496,77 @@ export async function createApp(options = {}) {
   async function apiSite({ res }) {
     const at = now();
     const assignments = (await store.listAssignments()).map((assignment) => publicAssignment(assignment, at)).sort(compareForStudents);
-    sendJson(res, 200, { title: await siteTitle(), assignments });
+    sendJson(res, 200, { title: await siteTitle(), maxFileBytes, assignments });
+  }
+
+  // ── 파일 올리기 ──
+  // 1) 올리기 시작: 이름과 크기를 알리고 번호와 토큰을 받습니다.
+  // 2) 조각 보내기: 정해진 크기로 나눈 조각을 차례로(또는 동시에) 보냅니다.
+  // 3) 제출: 제출 내용에 번호와 토큰을 실어 보내면 그 파일이 제출에 붙습니다. (apiSubmit)
+  // 제출하지 않은 파일은 한 시간 뒤에 지워지고, 올린 쪽이 먼저 취소할 수도 있습니다.
+
+  const UPLOAD_NOT_FOUND = '올리던 파일을 찾을 수 없습니다. 파일을 다시 선택해 주세요.';
+
+  // 아직 제출에 붙지 않은 파일을 토큰으로 확인하고 돌려줍니다.
+  async function findUpload(id, token) {
+    const file = Number.isSafeInteger(id) && typeof token === 'string' && token ? await store.getFile(id) : null;
+    if (!file || file.submission_id !== null || !sameSecret(sha256(token), file.token_hash)) return null;
+    return file;
+  }
+
+  async function requireUpload(req, id) {
+    const file = await findUpload(Number(id), String(req.headers['x-upload-token'] || ''));
+    if (!file) throw new HttpError(404, 'upload_not_found', UPLOAD_NOT_FOUND);
+    return file;
+  }
+
+  async function apiStartUpload({ req, res, params }) {
+    await throttlePosts(req);
+    const assignment = await findAssignmentBySlug(params[0]);
+    const body = await readJson(req, BODY_LIMIT);
+    if (!assignment.allow_files) throw new HttpError(403, 'files_off', '이 과제는 파일을 받지 않습니다.');
+    if (assignmentState(assignment, now()) === 'closed') throw new HttpError(403, 'closed', '이 과제는 제출이 마감되었습니다.');
+
+    const name = normalizeFileName(body.name);
+    const error = checkFile(name, body.size, maxFileBytes);
+    if (error) throw invalid({ file: error });
+
+    const gate = await limiter.take(`upload:${clientIp(req)}`, UPLOAD_STARTS, ATTEMPT_WINDOW_MS);
+    if (!gate.allowed) throw tooMany(gate.retryAfter, '파일을 너무 많이 올렸습니다.');
+
+    const token = newToken();
+    const chunks = Math.ceil(body.size / FILE_CHUNK_BYTES);
+    const uploadId = await store.createUpload({
+      assignmentId: assignment.id,
+      name,
+      size: body.size,
+      chunks,
+      tokenHash: sha256(token),
+      createdAt: now().toISOString(),
+      storageLimit: fileStorageBytes,
+    });
+    if (uploadId === null) {
+      throw new HttpError(403, 'storage_full', '파일을 저장할 공간이 부족해서 올릴 수 없습니다. 선생님께 알려 주세요.');
+    }
+    sendJson(res, 201, { uploadId, token, chunkSize: FILE_CHUNK_BYTES, chunks });
+  }
+
+  // 조각은 토큰이 있어야 보낼 수 있고 개수와 크기가 처음 알린 대로여야 하므로, 접속자별 요청 수는 따로 세지 않습니다.
+  async function apiPutChunk({ req, res, params }) {
+    const file = await requireUpload(req, params[0]);
+    const seq = Number(params[1]);
+    if (seq >= file.chunks) throw new HttpError(400, 'bad_chunk', '파일 조각의 순서가 맞지 않습니다.');
+    const expected = Math.min(FILE_CHUNK_BYTES, file.size - seq * FILE_CHUNK_BYTES);
+    const data = await readBytes(req, expected);
+    if (data.length !== expected) throw new HttpError(400, 'bad_chunk', '파일 조각의 크기가 맞지 않습니다.');
+    await store.putChunk(file.id, seq, data);
+    sendJson(res, 200, { ok: true });
+  }
+
+  async function apiCancelUpload({ req, res, params }) {
+    const file = await requireUpload(req, params[0]);
+    await store.discardUpload(file.id);
+    sendJson(res, 200, { ok: true });
   }
 
   async function apiSubmit({ req, res, params }) {
@@ -461,8 +577,24 @@ export async function createApp(options = {}) {
     // 본문을 받는 동안 선생님이 과제를 닫거나 지우거나 설정을 바꿨을 수 있으므로, 과제는 본문을 다 받은 뒤에 읽습니다.
     // 마감과 지각도 이 시각으로 판단합니다.
     const assignment = await findAssignmentBySlug(params[0]);
-    const { value, errors } = validateSubmission(body, { requireStudentId: Boolean(assignment.require_student_id) });
+    const allowFiles = Boolean(assignment.allow_files);
+
+    // 첨부 파일: 보내지 않으면 지금 있는 그대로, null 이면 빼고, { uploadId, token } 이면 방금 올린 파일로 바꿉니다.
+    let file = { action: 'keep' };
+    if (body.file === null) file = { action: 'remove' };
+    else if (body.file !== undefined) {
+      if (!allowFiles) throw invalid({ file: '이 과제는 파일을 받지 않습니다.' });
+      const upload = await findUpload(body.file?.uploadId, body.file?.token);
+      if (!upload || upload.assignment_id !== assignment.id) throw invalid({ file: UPLOAD_NOT_FOUND });
+      file = { action: 'attach', fileId: upload.id };
+    }
+
+    // 파일을 받는 과제에서는 링크를 비워 둘 수 있습니다. 링크도 파일도 없는 제출은 아래에서 거절합니다.
+    const { value, errors } = validateSubmission(body, { requireStudentId: Boolean(assignment.require_student_id), urlOptional: true });
     if (errors) throw invalid(errors);
+    const nothingToSubmit = () => invalid({ url: allowFiles ? '과제 링크를 입력하거나 파일을 첨부하세요.' : '과제 링크를 입력하세요.' });
+    if (!value.url && file.action === 'remove') throw nothingToSubmit();
+
     const at = now();
     if (assignmentState(assignment, at) === 'closed') {
       throw new HttpError(403, 'closed', '이 과제는 제출이 마감되었습니다.');
@@ -471,6 +603,7 @@ export async function createApp(options = {}) {
     // 학번을 적었으면 학번으로, 비워 두었으면 이름으로 같은 사람의 제출을 찾습니다.
     const submitter = submissionKey(value.studentId, value.name);
     const existing = await store.getSubmission(assignment.id, submitter);
+    if (!value.url && file.action === 'keep' && !(existing && existing.file_id)) throw nothingToSubmit();
     // "명단에 있는 학번만 받기"를 켜 두면 학번 오타나 장난 제출을 처음부터 막습니다. 학번 없이 내는 제출은 이름이 명단에 있어야 합니다.
     if (!existing && (await rosterOnly()) && (await store.rosterCount()) > 0) {
       if (value.studentId) {
@@ -501,8 +634,11 @@ export async function createApp(options = {}) {
       at: at.toISOString(),
       maxSubmissions,
       maxLinkChanges,
+      file,
     });
     if (saved.status === 'gone') throw new HttpError(404, 'not_found', '과제를 찾을 수 없습니다.');
+    if (saved.status === 'file_gone') throw invalid({ file: UPLOAD_NOT_FOUND });
+    if (saved.status === 'empty') throw nothingToSubmit();
     if (saved.status === 'conflict') {
       throw new HttpError(409, 'conflict', '같은 학번으로 방금 다른 제출이 들어왔습니다. 다시 한 번 제출해 주세요.');
     }
@@ -510,7 +646,8 @@ export async function createApp(options = {}) {
       throw new HttpError(403, 'full', '이 과제는 받을 수 있는 제출 수를 넘었습니다. 선생님께 알려 주세요.');
     }
     if (saved.status === 'too_many_changes') {
-      throw invalid({ url: `링크는 ${maxLinkChanges}번까지 바꿀 수 있습니다. 더 바꿔야 하면 선생님께 말씀드리세요.` });
+      const message = `링크와 파일은 ${maxLinkChanges}번까지 바꿀 수 있습니다. 더 바꿔야 하면 선생님께 말씀드리세요.`;
+      throw invalid(value.url ? { url: message } : { file: message });
     }
     sendJson(res, saved.status === 'created' ? 201 : 200, {
       status: saved.status,
@@ -613,6 +750,7 @@ export async function createApp(options = {}) {
       title: await siteTitle(),
       rosterCount: await store.rosterCount(),
       passwordFromEnv: Boolean(adminPassword),
+      files: { usedBytes: await store.fileBytes(), limitBytes: fileStorageBytes, maxFileBytes },
       assignments: (await store.listAssignments()).map((assignment) => ({
         ...adminAssignment(assignment, at),
         submissionCount: stats.get(assignment.id)?.total ?? 0,
@@ -636,8 +774,9 @@ export async function createApp(options = {}) {
     const body = await readJson(req, BODY_LIMIT);
     const { value, errors } = validateAssignment(body);
     if (errors) throw invalid(errors);
-    // 이 항목을 보내지 않는 요청(이 기능이 생기기 전에 열어 둔 관리 화면)은 지금 설정을 그대로 둡니다.
+    // 이 항목들을 보내지 않는 요청(그 기능이 생기기 전에 열어 둔 관리 화면)은 지금 설정을 그대로 둡니다.
     if (typeof body.requireStudentId !== 'boolean') value.requireStudentId = Boolean(existing.require_student_id);
+    if (typeof body.allowFiles !== 'boolean') value.allowFiles = Boolean(existing.allow_files);
     sendJson(res, 200, { assignment: adminAssignment(await store.updateAssignment(existing.id, value), now()) });
   }
 
@@ -692,12 +831,21 @@ export async function createApp(options = {}) {
         history: history.map((entry) => ({
           name: entry.student_name,
           url: entry.url,
+          fileName: entry.file_name,
           note: entry.note,
           submittedAt: entry.submitted_at,
           isLate: isLate(assignment, entry.submitted_at),
         })),
       },
     });
+  }
+
+  // 첨부 파일의 조각 하나. 관리 화면이 조각을 모두 받아 파일로 합칩니다.
+  // 학생이 올린 내용이 이 사이트의 화면으로 열리지 않도록, 항상 내려받는 내용으로만 보냅니다.
+  async function apiGetFileChunk({ res, params }) {
+    const data = await store.getChunk(Number(params[0]), Number(params[1]));
+    if (!data) throw new HttpError(404, 'not_found', '파일을 찾을 수 없습니다. 이미 삭제되었을 수 있습니다.');
+    send(res, 200, data, { 'Content-Type': 'application/octet-stream', 'Content-Disposition': 'attachment', 'Cache-Control': 'no-store' });
   }
 
   async function apiDeleteSubmission({ res, params }) {
@@ -768,6 +916,7 @@ export async function createApp(options = {}) {
 
   const SLUG = '([a-z0-9]{1,32})';
   const ID = '(\\d{1,12})';
+  // [방식, 주소, 처리 함수, 선택 사항]. 선택 사항의 body: 'bytes' 는 본문을 JSON 대신 파일 내용(application/octet-stream)으로 받는 주소입니다.
   const routes = [
     ['GET', /^\/$/, pageStudent],
     ['GET', new RegExp(`^/a/${SLUG}/?$`), pageStudent],
@@ -780,6 +929,10 @@ export async function createApp(options = {}) {
     ['GET', /^\/api\/site$/, apiSite],
     ['POST', new RegExp(`^/api/assignments/${SLUG}/submissions$`), apiSubmit],
     ['POST', new RegExp(`^/api/assignments/${SLUG}/lookup$`), apiLookup],
+    ['POST', new RegExp(`^/api/assignments/${SLUG}/uploads$`), apiStartUpload],
+    // 조각은 JSON 이 아니라 파일 내용 그대로 받습니다.
+    ['PUT', new RegExp(`^/api/uploads/${ID}/chunks/(\\d{1,6})$`), apiPutChunk, { body: 'bytes' }],
+    ['DELETE', new RegExp(`^/api/uploads/${ID}$`), apiCancelUpload],
 
     ['GET', /^\/api\/admin\/session$/, apiSession],
     ['POST', /^\/api\/admin\/login$/, apiLogin],
@@ -794,6 +947,7 @@ export async function createApp(options = {}) {
     ['GET', new RegExp(`^/api/admin/submissions/${ID}$`), admin(apiGetSubmission)],
     ['DELETE', new RegExp(`^/api/admin/submissions/${ID}$`), admin(apiDeleteSubmission)],
     ['POST', new RegExp(`^/api/admin/submissions/${ID}/reset-password$`), admin(apiResetSubmissionPassword)],
+    ['GET', new RegExp(`^/api/admin/files/${ID}/chunks/(\\d{1,6})$`), admin(apiGetFileChunk)],
     ['GET', /^\/api\/admin\/roster$/, admin(apiGetRoster)],
     ['PUT', /^\/api\/admin\/roster$/, admin(apiPutRoster)],
     ['PUT', /^\/api\/admin\/settings$/, admin(apiPutSettings)],
@@ -810,7 +964,7 @@ export async function createApp(options = {}) {
     const method = req.method === 'HEAD' ? 'GET' : req.method;
 
     let knownPath = false;
-    for (const [routeMethod, pattern, handler] of routes) {
+    for (const [routeMethod, pattern, handler, options] of routes) {
       const match = pattern.exec(url.pathname);
       if (!match) continue;
       knownPath = true;
@@ -818,13 +972,13 @@ export async function createApp(options = {}) {
       if (method !== 'GET') {
         // 다른 주소의 페이지가 로그인한 선생님의 브라우저를 빌려 요청을 보내는 것(CSRF)을 두 겹으로 막습니다.
         // 1) 브라우저가 알려 주는 출처가 이 사이트 자신이 아니면 받지 않습니다. 같은 도메인의 다른 주소(same-site)도 남입니다.
-        // 2) 내용을 바꾸는 요청은 본문이 없어도 JSON 형식이어야 합니다. 다른 주소의 페이지가 이런 요청을 보내려면
-        //    브라우저의 사전 확인(CORS)을 통과해야 하는데, 이 서버는 그 확인에 응하지 않습니다.
+        // 2) 내용을 바꾸는 요청은 본문이 없어도 JSON 형식(파일 조각은 application/octet-stream)이어야 합니다.
+        //    다른 주소의 페이지가 이런 형식의 요청을 보내려면 브라우저의 사전 확인(CORS)을 통과해야 하는데, 이 서버는 그 확인에 응하지 않습니다.
         const fetchSite = req.headers['sec-fetch-site'];
         if (fetchSite && fetchSite !== 'same-origin') {
           throw new HttpError(403, 'cross_site', '다른 사이트에서 보낸 요청은 받지 않습니다.');
         }
-        if (contentType(req) !== 'application/json') {
+        if (contentType(req) !== (options?.body === 'bytes' ? 'application/octet-stream' : 'application/json')) {
           throw new HttpError(415, 'unsupported_media_type', '요청 형식이 올바르지 않습니다.');
         }
       }
@@ -844,7 +998,7 @@ export async function createApp(options = {}) {
     else sendText(res, status, `${message}\n`, headers);
   }
 
-  // 만료된 횟수 기록과 로그인을 가끔 치웁니다. 타이머 없이 요청이 올 때 처리해서 어떤 실행 환경에서도 같게 동작합니다.
+  // 만료된 횟수 기록과 로그인, 제출하지 않은 채 남은 파일을 가끔 치웁니다. 타이머 없이 요청이 올 때 처리해서 어떤 실행 환경에서도 같게 동작합니다.
   let lastCleanup = now().getTime();
   async function cleanUp() {
     const at = now();
@@ -852,6 +1006,8 @@ export async function createApp(options = {}) {
     lastCleanup = at.getTime();
     await limiter.prune();
     await store.pruneSessions(at.toISOString());
+    await store.discardExpiredUploads(new Date(at.getTime() - UPLOAD_LIFETIME_MS).toISOString());
+    await store.sweepOrphanChunks();
   }
 
   async function handle(req, res) {

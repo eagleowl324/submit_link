@@ -253,6 +253,51 @@ test('관리자 비밀번호를 처음 정하고, 과제를 만들고, 학생이
   assert.deepEqual((await call(handler, 'GET', '/api/site')).json.assignments, []);
 });
 
+test('첨부 파일은 조각으로 오가도 내용이 그대로이고, 한도는 환경 변수로 바꿀 수 있다', { skip }, async (t) => {
+  const folder = await temporaryFolder(t);
+  const handler = instance(folder, { ...DATABASE_ENV, MAX_FILE_MB: '2', FILE_STORAGE_MB: '5' });
+  const cookie = await setUp(handler);
+  const created = await call(handler, 'POST', '/api/admin/assignments', { cookie, body: { title: '과제' } });
+  const { slug, id } = created.json.assignment;
+  assert.equal((await call(handler, 'GET', '/api/site')).json.maxFileBytes, 2 * 1024 * 1024);
+
+  // 0~255 의 모든 값이 섞여 있는 내용 (조각 두 개)
+  const content = Buffer.from(Array.from({ length: 700_000 }, (_, index) => (index * 31 + (index >> 8)) & 0xff));
+  const started = await call(handler, 'POST', `/api/assignments/${slug}/uploads`, { body: { name: 'a.bin', size: content.length } });
+  assert.equal(started.status, 201, started.text);
+  const { uploadId, token, chunkSize, chunks } = started.json;
+  for (let seq = 0; seq < chunks; seq += 1) {
+    // Vercel 이 주소를 함수 자신의 주소로 바꿔 넘겨 주는 경우로 보낸다.
+    const sent = await call(handler, 'PUT', `/api/app?__path=/api/uploads/${uploadId}/chunks/${seq}`, {
+      raw: content.subarray(seq * chunkSize, (seq + 1) * chunkSize),
+      headers: { 'Content-Type': 'application/octet-stream', 'X-Upload-Token': token },
+    });
+    assert.equal(sent.status, 200, sent.text);
+  }
+  const submitted = await call(handler, 'POST', `/api/assignments/${slug}/submissions`, {
+    body: { studentId: '20301', name: '김하늘', url: '', password: 'pass1234', file: { uploadId, token } },
+  });
+  assert.equal(submitted.status, 201, submitted.text);
+
+  // 올린 곳과 다른 실행 단위에서 받아도 같은 내용이다.
+  const another = instance(folder);
+  const list = await call(another, 'GET', `/api/admin/assignments/${id}/submissions`, { cookie });
+  const { file } = list.json.submissions[0];
+  assert.deepEqual([file.name, file.size, file.chunks], ['a.bin', 700_000, 2]);
+  const parts = [];
+  for (let seq = 0; seq < file.chunks; seq += 1) {
+    const response = await another(new Request(`${ORIGIN}/api/admin/files/${file.id}/chunks/${seq}`, { headers: { Cookie: cookie, 'x-real-ip': '203.0.113.9' } }));
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get('content-type'), 'application/octet-stream');
+    parts.push(Buffer.from(await response.arrayBuffer()));
+  }
+  assert.ok(Buffer.concat(parts).equals(content));
+  assert.equal((await another(new Request(`${ORIGIN}/api/admin/files/${file.id}/chunks/0`))).status, 401);
+
+  const tooBig = await call(handler, 'POST', `/api/assignments/${slug}/uploads`, { body: { name: 'big.bin', size: 2 * 1024 * 1024 + 1 } });
+  assert.match(tooBig.json.error.fields.file, /2MB까지/);
+});
+
 test('실행 단위가 바뀌어도 로그인·데이터·비밀번호 잠금이 이어진다', { skip }, async (t) => {
   const folder = await temporaryFolder(t);
   const first = instance(folder);

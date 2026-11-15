@@ -5,7 +5,7 @@
 // 직접 띄우는 Node.js 서버와 같은 것을 씁니다.
 // 화면에 쓰이는 정적 파일(/assets/...)은 Vercel 이 직접 내보내고, 나머지 요청만 여기로 옵니다(vercel.json).
 
-import { createApp, rateKey } from './app.js';
+import { createApp, fileLimitsFromEnv, rateKey } from './app.js';
 import { Store } from './db.js';
 import { serve } from './fetch.js';
 import { LibsqlDatabase } from './libsql.js';
@@ -92,6 +92,8 @@ export function createVercelHandler({ env, createClient, serialize = false }) {
       // ADMIN_PASSWORD 를 정해 두지 않으면 관리 화면에 처음 들어갔을 때 비밀번호를 만듭니다.
       adminPassword: env.ADMIN_PASSWORD || '',
       setup: 'web',
+      // 첨부 파일 한도는 MAX_FILE_MB, FILE_STORAGE_MB 로 바꿀 수 있습니다.
+      limits: fileLimitsFromEnv(env),
       // 요청마다 다른 실행 단위가 받을 수 있으므로, 비밀번호를 틀린 횟수는 데이터베이스에 남깁니다.
       limiter: new RateLimiter(Date.now, new StoredBuckets(store)),
       // 접속자 주소는 Vercel 이 붙여 주는 값이라 보내는 쪽이 꾸밀 수 없습니다.

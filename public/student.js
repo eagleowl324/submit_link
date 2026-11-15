@@ -1,7 +1,16 @@
 // 학생 화면: 과제 목록(/)과 과제별 제출 화면(/a/주소)
 
-import { api, dueBadge, dueText, externalLink, field, fill, formatDateTime, h, richText } from './ui.js';
-import { LIMITS, checkStudentId, normalizeName, normalizeStudentId, validateSubmission } from './shared/rules.js';
+import { api, dueBadge, dueText, externalLink, field, fill, formatDateTime, h, richText, sendBytes } from './ui.js';
+import {
+  LIMITS,
+  checkFile,
+  checkStudentId,
+  formatBytes,
+  normalizeFileName,
+  normalizeName,
+  normalizeStudentId,
+  validateSubmission,
+} from './shared/rules.js';
 
 const app = document.getElementById('app');
 const slug = /^\/a\/([a-z0-9]+)\/?$/.exec(location.pathname)?.[1] ?? null;
@@ -26,6 +35,54 @@ function remember(me) {
   } catch {
     // 저장이 막힌 브라우저에서는 그냥 넘어갑니다.
   }
+}
+
+// 조각 하나를 보냅니다. 연결이 잠깐 끊겼거나 서버가 바빴다면 두 번까지 다시 보냅니다.
+async function putChunk(path, part, token) {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await sendBytes('PUT', path, part, { 'X-Upload-Token': token });
+      return;
+    } catch (error) {
+      const worthRetrying = error.status === 0 || error.status === 429 || error.status >= 500;
+      if (!worthRetrying || attempt >= 2) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 600 * (attempt + 1)));
+    }
+  }
+}
+
+function cancelUpload(upload) {
+  // 실패해도 서버가 한 시간 뒤에 스스로 지우므로 결과를 기다리지 않습니다.
+  api('DELETE', `/api/uploads/${upload.uploadId}`, undefined, { 'X-Upload-Token': upload.token }).catch(() => {});
+}
+
+// 파일을 조각으로 나눠 올립니다. (한 번에 보낼 수 있는 크기에 한도가 있는 서버에서도 큰 파일을 올릴 수 있게)
+// 다 올리면 제출에 실어 보낼 { uploadId, token } 을 돌려줍니다. onProgress 는 0~1 사이 값으로 불립니다.
+async function uploadFile(endpoint, blob, onProgress) {
+  onProgress(0);
+  const { uploadId, token, chunkSize, chunks } = await api('POST', `${endpoint}/uploads`, { name: blob.name, size: blob.size });
+  let next = 0;
+  let sent = 0;
+  let failed = false;
+  async function worker() {
+    while (next < chunks && !failed) {
+      const seq = next;
+      next += 1;
+      const part = blob.slice(seq * chunkSize, (seq + 1) * chunkSize);
+      await putChunk(`/api/uploads/${uploadId}/chunks/${seq}`, part, token);
+      sent += part.size;
+      onProgress(sent / blob.size);
+    }
+  }
+  try {
+    // 세 조각씩 동시에 보냅니다.
+    await Promise.all(Array.from({ length: Math.min(3, chunks) }, worker));
+  } catch (error) {
+    failed = true;
+    cancelUpload({ uploadId, token });
+    throw error;
+  }
+  return { uploadId, token };
 }
 
 function siteHead(site, linkToList) {
@@ -79,6 +136,8 @@ function showAssignment(site, assignment) {
 
   // 학번을 꼭 받지 않는 과제에서는 학번을 비워 두고 낼 수 있고, 그런 제출은 이름으로 구분합니다.
   const idOptional = assignment.requireStudentId === false;
+  // 파일을 받는 과제에서는 링크 대신, 또는 링크와 함께 파일 하나를 낼 수 있습니다.
+  const allowFiles = assignment.allowFiles === true;
 
   const stage = h('div', { class: 'stage' });
   fill(
@@ -96,7 +155,9 @@ function showAssignment(site, assignment) {
   );
 
   const me = recall();
-  const draft = { studentId: me.studentId, name: me.name, url: '', note: '', password: '' };
+  // draft.file: 없으면 null. 이미 낸 파일은 { name, size }, 이번에 고른 파일은 { name, size, blob, upload } 이고
+  // upload 는 다 올린 뒤에 받는 { uploadId, token } 입니다(올리기 전에는 null).
+  const draft = { studentId: me.studentId, name: me.name, url: '', note: '', password: '', file: null };
   const endpoint = `/api/assignments/${assignment.slug}`;
 
   if (assignment.state === 'closed') showClosed();
@@ -151,6 +212,62 @@ function showAssignment(site, assignment) {
         value: draft.url,
       }),
     });
+    // 파일 고르기. 이미 낸 파일이나 방금 고른 파일의 이름을 보여 주고, 빼거나 다른 파일로 바꿀 수 있습니다.
+    const fileInput = h('input', { class: 'offscreen', type: 'file', tabindex: '-1', 'aria-hidden': 'true' });
+    const pick = h('button', { class: 'button button-secondary button-small', type: 'button', id: 'file', onclick: () => fileInput.click() });
+    const chosen = h('p', { class: 'file-chosen' });
+    const file = field({
+      id: 'file',
+      label: '파일 첨부',
+      optional: true,
+      hint: `링크 대신 파일만 내도 됩니다. 파일은 한 개, ${formatBytes(site.maxFileBytes)}까지 올릴 수 있습니다.`,
+      control: pick,
+    });
+    const picker = h('div', { class: 'file-picker' });
+    pick.replaceWith(picker);
+    picker.append(chosen, pick, fileInput);
+
+    function showFile() {
+      fill(
+        chosen,
+        draft.file
+          ? [
+              h('span', { class: 'file-name' }, draft.file.name),
+              h('span', { class: 'file-size' }, formatBytes(draft.file.size)),
+              h(
+                'button',
+                {
+                  class: 'text-button',
+                  type: 'button',
+                  onclick: () => {
+                    setFile(null);
+                    pick.focus();
+                  },
+                },
+                '빼기',
+              ),
+            ]
+          : null,
+      );
+      chosen.hidden = !draft.file;
+      pick.textContent = draft.file ? '다른 파일 고르기' : '파일 고르기';
+    }
+
+    function setFile(next) {
+      if (draft.file?.upload) cancelUpload(draft.file.upload);
+      draft.file = next;
+      file.setError((next?.blob && checkFile(normalizeFileName(next.name), next.size, site.maxFileBytes)) || '');
+      showFile();
+    }
+
+    fileInput.addEventListener('change', () => {
+      const picked = fileInput.files[0];
+      // 같은 파일을 다시 골라도 알 수 있게 비워 둡니다.
+      fileInput.value = '';
+      if (picked) setFile({ name: picked.name, size: picked.size, blob: picked, upload: null });
+    });
+    showFile();
+
     const note = field({
       id: 'note',
       label: '메모',
@@ -184,7 +301,7 @@ function showAssignment(site, assignment) {
     const password = field({
       id: 'password',
       label: '수정용 비밀번호',
-      hint: `나중에 링크를 고치거나 확인할 때 씁니다. ${LIMITS.passwordMin}자 이상, 평소 쓰는 비밀번호 말고 이 과제용으로 정하세요.`,
+      hint: `나중에 제출한 내용을 고치거나 확인할 때 씁니다. ${LIMITS.passwordMin}자 이상, 평소 쓰는 비밀번호 말고 이 과제용으로 정하세요.`,
       control: passwordInput,
     });
     // 입력 칸 옆에 [보기] 버튼을 붙입니다.
@@ -192,7 +309,7 @@ function showAssignment(site, assignment) {
     passwordInput.replaceWith(passwordRow);
     passwordRow.append(passwordInput, reveal);
 
-    const fields = { studentId, name, url, note, password };
+    const fields = { studentId, name, url, ...(allowFiles ? { file } : {}), note, password };
     const message = h('p', { class: 'form-message', role: 'alert', hidden: true });
     const submit = h('button', { class: 'button button-primary button-block', type: 'submit' }, '제출하기');
 
@@ -214,25 +331,50 @@ function showAssignment(site, assignment) {
             note: note.input.value,
             password: passwordInput.value,
           });
-          const { value, errors } = validateSubmission(draft, { requireStudentId: !idOptional });
-          if (errors) {
-            showErrors(errors);
+          // 파일을 첨부했으면 링크는 비워 둘 수 있습니다.
+          const { value, errors } = validateSubmission(draft, { requireStudentId: !idOptional, urlOptional: Boolean(draft.file) });
+          const problems = { ...errors };
+          if (allowFiles && problems.url && !draft.url.trim()) problems.url = '과제 링크를 입력하거나 파일을 첨부하세요.';
+          const fileProblem = draft.file?.blob && checkFile(normalizeFileName(draft.file.name), draft.file.size, site.maxFileBytes);
+          if (fileProblem) problems.file = fileProblem;
+          if (Object.keys(problems).length) {
+            showErrors(problems);
             return;
           }
 
           submit.disabled = true;
-          submit.textContent = '제출하는 중…';
+          let uploading = false;
           try {
-            const result = await api('POST', `${endpoint}/submissions`, value);
+            // 이번에 고른 파일은 먼저 올립니다. 제출이 거절되어 다시 누를 때는 이미 올린 것을 그대로 씁니다.
+            const picked = draft.file?.blob ? draft.file : null;
+            if (picked && !picked.upload) {
+              uploading = true;
+              picked.upload = await uploadFile(endpoint, picked.blob, (ratio) => {
+                submit.textContent = `파일 올리는 중… ${Math.floor(ratio * 100)}%`;
+              });
+              uploading = false;
+            }
+
+            submit.textContent = '제출하는 중…';
+            // 파일: 이번에 고른 것은 올린 번호를 싣고, 이미 낸 것을 그대로 둘 때는 아무것도 싣지 않고, 뺐으면 null 을 보냅니다.
+            const payload = { ...value };
+            if (picked) payload.file = picked.upload;
+            else if (allowFiles && !draft.file) payload.file = null;
+            const result = await api('POST', `${endpoint}/submissions`, payload);
             // 학번 없이 냈을 때는 전에 기억해 둔 학번을 지우지 않습니다.
             remember({ studentId: value.studentId || recall().studentId, name: value.name });
-            Object.assign(draft, value);
+            Object.assign(draft, value, { file: result.submission.file });
             showReceipt(result.submission, result.status);
           } catch (error) {
             if (error.code === 'closed') {
               assignment.state = 'closed';
               showClosed();
+            } else if (uploading) {
+              file.setError(error.fields?.file || `파일을 올리지 못했습니다. ${error.message}`);
+              pick.focus();
             } else if (error.fields) {
+              // 올려 둔 파일을 서버가 찾지 못하면(시간이 지나 지워진 경우) 다음에 다시 올립니다.
+              if (error.fields.file && draft.file?.blob) draft.file.upload = null;
               showErrors(error.fields);
             } else {
               message.textContent = error.message;
@@ -249,6 +391,7 @@ function showAssignment(site, assignment) {
         : null,
       h('div', { class: 'field-row' }, studentId.wrap, name.wrap),
       url.wrap,
+      allowFiles ? file.wrap : null,
       note.wrap,
       password.wrap,
       message,
@@ -327,7 +470,14 @@ function showAssignment(site, assignment) {
               password: password.input.value,
             });
             const found = result.submission;
-            Object.assign(draft, { studentId: found.studentId, name: found.name, url: found.url, note: found.note, password: password.input.value });
+            Object.assign(draft, {
+              studentId: found.studentId,
+              name: found.name,
+              url: found.url,
+              note: found.note,
+              password: password.input.value,
+              file: found.file,
+            });
             showReceipt(found, 'found');
           } catch (error) {
             if (error.fields?.password) password.setError(error.fields.password);
@@ -377,8 +527,10 @@ function showAssignment(site, assignment) {
           submission.studentId ? [h('dt', {}, '학번'), h('dd', { class: 'tabular' }, submission.studentId)] : null,
           h('dt', {}, '이름'),
           h('dd', {}, submission.name),
-          h('dt', {}, '링크'),
-          h('dd', {}, externalLink(submission.url, submission.url, 'receipt-link')),
+          submission.url ? [h('dt', {}, '링크'), h('dd', {}, externalLink(submission.url, submission.url, 'receipt-link'))] : null,
+          submission.file
+            ? [h('dt', {}, '파일'), h('dd', {}, submission.file.name, h('span', { class: 'muted' }, ` · ${formatBytes(submission.file.size)}`))]
+            : null,
           submission.note ? [h('dt', {}, '메모'), h('dd', { class: 'receipt-note' }, submission.note)] : null,
           h('dt', {}, '제출 시각'),
           h(
@@ -392,14 +544,16 @@ function showAssignment(site, assignment) {
         h(
           'p',
           { class: 'receipt-advice' },
-          '위 링크를 눌러 잘 열리는지 꼭 확인하세요.',
+          submission.url ? '위 링크를 눌러 잘 열리는지 꼭 확인하세요.' : '파일이 선생님께 전달되었습니다.',
           editable ? ` 고치려면 같은 ${submission.studentId ? '학번' : '이름'}과 비밀번호로 다시 제출하면 됩니다.` : '',
         ),
         h(
           'div',
           { class: 'receipt-actions' },
-          h('a', { class: 'button button-secondary', href: submission.url, target: '_blank', rel: 'noopener noreferrer' }, '링크 열어 보기'),
-          editable ? h('button', { class: 'button button-ghost', type: 'button', onclick: showForm }, '링크 고치기') : null,
+          submission.url
+            ? h('a', { class: 'button button-secondary', href: submission.url, target: '_blank', rel: 'noopener noreferrer' }, '링크 열어 보기')
+            : null,
+          editable ? h('button', { class: 'button button-ghost', type: 'button', onclick: showForm }, '제출 내용 고치기') : null,
         ),
       ),
     );

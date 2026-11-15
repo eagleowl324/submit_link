@@ -12,6 +12,7 @@ export const LIMITS = Object.freeze({
   description: 2000,
   siteTitle: 60,
   rosterSize: 5000,
+  fileName: 120,
   adminPasswordMin: 8,
   adminPasswordMax: 200,
 });
@@ -82,6 +83,43 @@ export function nameKey(name) {
 export function checkName(name) {
   if (!name) return '이름을 입력하세요.';
   if (name.length > LIMITS.name) return `이름은 ${LIMITS.name}자까지 쓸 수 있습니다.`;
+  return null;
+}
+
+// ── 첨부 파일 ──
+
+// 내려받은 사람이 무심코 눌러 실행할 수 있는 종류는 받지 않습니다.
+const BLOCKED_FILE_TYPES = new Set(['exe', 'com', 'scr', 'pif', 'msi', 'bat', 'cmd', 'vbs', 'lnk']);
+
+// 예: 820KB, 3.4MB, 1.5GB
+export function formatBytes(bytes) {
+  if (bytes < 1024) return `${bytes}B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)}KB`;
+  const unit = bytes < 1024 * 1024 * 1024 ? 'MB' : 'GB';
+  const amount = bytes / (unit === 'MB' ? 1024 * 1024 : 1024 * 1024 * 1024);
+  return `${amount >= 100 || Number.isInteger(amount) ? Math.round(amount) : amount.toFixed(1)}${unit}`;
+}
+
+// 파일 이름을 다듬습니다. 폴더 구분 글자(/ \)와 운영체제가 파일 이름에 받지 않는 글자는 _ 로 바꾸고,
+// 너무 길면 확장자를 남기고 앞쪽을 자릅니다.
+export function normalizeFileName(raw) {
+  const name = singleLine(text(raw).slice(0, LIMITS.fileName * 4))
+    .replace(/[\\/:*?"<>|]/g, '_')
+    .replace(/^[. ]+|[. ]+$/g, '');
+  if (name.length <= LIMITS.fileName) return name;
+  const dot = name.lastIndexOf('.');
+  const extension = dot > 0 && name.length - dot <= 12 ? name.slice(dot) : '';
+  return name.slice(0, LIMITS.fileName - extension.length) + extension;
+}
+
+// name 은 normalizeFileName 으로 다듬은 이름, size 는 바이트 수, maxBytes 는 파일 하나의 한도입니다.
+export function checkFile(name, size, maxBytes) {
+  if (!name) return '파일 이름을 알 수 없습니다. 파일을 다시 선택해 주세요.';
+  const extension = name.includes('.') ? name.slice(name.lastIndexOf('.') + 1).toLowerCase() : '';
+  if (BLOCKED_FILE_TYPES.has(extension)) return `.${extension} 파일은 올릴 수 없습니다. 꼭 내야 한다면 압축(zip)해서 올리세요.`;
+  if (!Number.isInteger(size) || size < 0) return '파일을 읽을 수 없습니다. 파일을 다시 선택해 주세요.';
+  if (size === 0) return '내용이 없는 빈 파일입니다.';
+  if (size > maxBytes) return `파일이 너무 큽니다. ${formatBytes(maxBytes)}까지 올릴 수 있습니다.`;
   return null;
 }
 
@@ -173,7 +211,8 @@ function result(value, errors) {
 }
 
 // requireStudentId 가 false 면(과제 설정) 학번을 비워 둔 제출도 받습니다. 그때 value.studentId 는 '' 입니다.
-export function validateSubmission(input, { requireStudentId = true } = {}) {
+// urlOptional 이 true 면(파일을 첨부한 제출) 링크를 비워 둘 수 있습니다. 그때 value.url 은 '' 입니다.
+export function validateSubmission(input, { requireStudentId = true, urlOptional = false } = {}) {
   const errors = {};
 
   const studentId = requireStudentId ? readStudentId(input?.studentId) : readOptionalStudentId(input?.studentId);
@@ -182,7 +221,8 @@ export function validateSubmission(input, { requireStudentId = true } = {}) {
   const name = readName(input?.name);
   if (name.error) errors.name = name.error;
 
-  const link = normalizeUrl(input?.url);
+  const noLink = urlOptional && !oversized(input?.url, LIMITS.url) && text(input?.url).replace(INVISIBLE, '').trim() === '';
+  const link = noLink ? { url: '' } : normalizeUrl(input?.url);
   if (link.error) errors.url = link.error;
 
   const note = read(input?.note, LIMITS.note, multiLine, checkNote);
@@ -221,6 +261,7 @@ export function validateAssignment(input) {
       allowLate: input?.allowLate !== false,
       isOpen: input?.isOpen !== false,
       requireStudentId: input?.requireStudentId !== false,
+      allowFiles: input?.allowFiles !== false,
     },
     errors,
   );

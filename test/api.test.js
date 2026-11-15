@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { randomBytes } from 'node:crypto';
 import http from 'node:http';
 import { mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
@@ -65,14 +66,49 @@ async function start(t, options = {}) {
       body: { studentId: '20301', name: '김하늘', url: 'https://example.com/work', password: 'pass1234', ...fields },
     });
 
-  return { app, base, clock, dataDir, request, login, createAssignment, submit };
+  // 화면의 스크립트가 하듯이 파일을 조각으로 나눠 올리고, 제출에 실어 보낼 { uploadId, token } 을 돌려줍니다.
+  async function upload(slug, name, content) {
+    const started = await request('POST', `/api/assignments/${slug}/uploads`, { body: { name, size: content.length } });
+    assert.equal(started.status, 201, started.text);
+    const { uploadId, token, chunkSize, chunks } = started.json;
+    for (let seq = 0; seq < chunks; seq += 1) {
+      const sent = await putChunk(uploadId, token, seq, content.subarray(seq * chunkSize, (seq + 1) * chunkSize));
+      assert.equal(sent.status, 200, sent.text);
+    }
+    return { uploadId, token };
+  }
+
+  const putChunk = (uploadId, token, seq, data, headers = {}) =>
+    request('PUT', `/api/uploads/${uploadId}/chunks/${seq}`, {
+      raw: data,
+      headers: { 'Content-Type': 'application/octet-stream', 'X-Upload-Token': token, ...headers },
+    });
+
+  // 관리 화면이 하듯이 조각을 모두 받아 합칩니다. file 은 관리자용 제출 목록의 file 항목입니다.
+  async function download(cookie, file) {
+    const parts = [];
+    for (let seq = 0; seq < file.chunks; seq += 1) {
+      const response = await fetch(`${base}/api/admin/files/${file.id}/chunks/${seq}`, { headers: { Cookie: cookie } });
+      assert.equal(response.status, 200, `조각 ${seq}`);
+      assert.equal(response.headers.get('content-type'), 'application/octet-stream');
+      assert.equal(response.headers.get('content-disposition'), 'attachment');
+      assert.equal(response.headers.get('x-content-type-options'), 'nosniff');
+      parts.push(Buffer.from(await response.arrayBuffer()));
+    }
+    return Buffer.concat(parts);
+  }
+
+  const listSubmissions = async (cookie, assignment) =>
+    (await request('GET', `/api/admin/assignments/${assignment.id}/submissions`, { cookie })).json.submissions;
+
+  return { app, base, clock, dataDir, request, login, createAssignment, submit, upload, putChunk, download, listSubmissions };
 }
 
 test('과제가 없을 때 학생 화면 API는 빈 목록을 준다', async (t) => {
   const { request } = await start(t);
   const response = await request('GET', '/api/site');
   assert.equal(response.status, 200);
-  assert.deepEqual(response.json, { title: '과제 링크 제출함', assignments: [] });
+  assert.deepEqual(response.json, { title: '과제 링크 제출함', maxFileBytes: 10 * 1024 * 1024, assignments: [] });
   assert.equal(response.headers.get('cache-control'), 'no-store');
 });
 
@@ -176,7 +212,16 @@ test('과제 만들기·고치기·지우기', async (t) => {
 
   const site = await request('GET', '/api/site');
   assert.deepEqual(site.json.assignments, [
-    { slug: created.slug, title: '1차 과제', description: '링크를 내세요', dueAt: '2026-11-20T14:59:00.000Z', allowLate: true, requireStudentId: true, state: 'open' },
+    {
+      slug: created.slug,
+      title: '1차 과제',
+      description: '링크를 내세요',
+      dueAt: '2026-11-20T14:59:00.000Z',
+      allowLate: true,
+      requireStudentId: true,
+      allowFiles: true,
+      state: 'open',
+    },
   ]);
 
   const updated = await request('PUT', `/api/admin/assignments/${created.id}`, {
@@ -205,6 +250,7 @@ test('제출: 처음 내기 → 틀린 비밀번호 거절 → 맞는 비밀번�
     studentId: '20301',
     name: '김하늘',
     url: 'https://example.com/v1',
+    file: null,
     note: '첫 제출',
     revision: 1,
     createdAt: '2026-11-15T03:00:00.000Z',
@@ -244,7 +290,9 @@ test('제출: 처음 내기 → 틀린 비밀번호 거절 → 맞는 비밀번�
   const detail = await request('GET', `/api/admin/submissions/${row.id}`, { cookie });
   assert.equal(detail.status, 200);
   assert.equal(detail.json.submission.url, 'https://example.com/v2');
-  assert.deepEqual(detail.json.submission.history, [{ name: '김하늘', url: 'https://example.com/v1', note: '첫 제출', submittedAt: '2026-11-15T03:00:00.000Z', isLate: false }]);
+  assert.deepEqual(detail.json.submission.history, [
+    { name: '김하늘', url: 'https://example.com/v1', fileName: '', note: '첫 제출', submittedAt: '2026-11-15T03:00:00.000Z', isLate: false },
+  ]);
   assert.equal(JSON.stringify(detail.json).includes('scrypt'), false);
   assert.equal((await request('GET', '/api/admin/submissions/999', { cookie })).status, 404);
 });
@@ -616,20 +664,286 @@ test('이 기능이 생기기 전에 만든 데이터도 그대로 이어 쓴다
   await first.submit(assignment.slug);
   await first.app.close();
 
-  // 데이터 파일을 "학번 필수 입력" 항목이 없던 때의 모양으로 되돌린다.
+  // 데이터 파일을 "학번 필수 입력"도 첨부 파일도 없던 때의 모양으로 되돌린다.
   const file = new DatabaseSync(path.join(first.dataDir, 'submissions.db'));
-  file.exec("ALTER TABLE assignments DROP COLUMN require_student_id; UPDATE settings SET value = '1' WHERE key = 'schema_version';");
+  file.exec(`
+    DROP TABLE file_chunks;
+    DROP TABLE files;
+    ALTER TABLE submission_history DROP COLUMN file_name;
+    ALTER TABLE assignments DROP COLUMN allow_files;
+    ALTER TABLE assignments DROP COLUMN require_student_id;
+    UPDATE settings SET value = '1' WHERE key = 'schema_version';
+  `);
   file.close();
 
   const second = await start(t, { dataDir: first.dataDir, clock: first.clock });
   const [carried] = (await second.request('GET', '/api/site')).json.assignments;
   assert.equal(carried.slug, assignment.slug);
   assert.equal(carried.requireStudentId, true, '전에 만든 과제는 지금까지처럼 학번을 받는다');
+  assert.equal(carried.allowFiles, true, '전에 만든 과제도 파일을 받는다');
   assert.equal((await second.submit(assignment.slug, { studentId: '' })).status, 400);
   assert.equal((await second.submit(assignment.slug, { url: 'https://example.com/v2' })).status, 200, '전에 낸 제출도 그대로 고칠 수 있다');
 
   const optional = await second.createAssignment(await second.login(), { title: '새 과제', requireStudentId: false });
   assert.equal((await second.submit(optional.slug, { studentId: '' })).status, 201);
+});
+
+test('파일 첨부: 링크 대신 파일만 내거나 함께 낼 수 있고, 관리 화면에서 그대로 내려받는다', async (t) => {
+  const { request, login, createAssignment, submit, upload, download, listSubmissions, base } = await start(t);
+  const cookie = await login();
+  const assignment = await createAssignment(cookie);
+  assert.equal(assignment.allowFiles, true, '따로 정하지 않으면 파일을 받는다');
+
+  // 조각 세 개로 나뉘는 크기 (조각 하나는 512KB)
+  const game = randomBytes(1_300_000);
+  const onlyFile = await submit(assignment.slug, { url: '', file: await upload(assignment.slug, ' 벽돌/깨기.html ', game) });
+  assert.equal(onlyFile.status, 201, onlyFile.text);
+  assert.equal(onlyFile.json.submission.url, '');
+  assert.deepEqual(onlyFile.json.submission.file, { name: '벽돌_깨기.html', size: 1_300_000 }, '학생에게는 이름과 크기만 알려 준다');
+
+  const small = Buffer.from('<h1>hello</h1>');
+  const both = await submit(assignment.slug, { studentId: '20302', name: '이도윤', url: 'example.com/lee', file: await upload(assignment.slug, 'index.html', small) });
+  assert.equal(both.status, 201);
+  assert.equal(both.json.submission.url, 'https://example.com/lee');
+  assert.deepEqual(both.json.submission.file, { name: 'index.html', size: small.length });
+
+  // 링크도 파일도 없으면 받지 않는다.
+  const nothing = await submit(assignment.slug, { studentId: '20303', name: '박서연', url: '' });
+  assert.equal(nothing.status, 400);
+  assert.match(nothing.json.error.fields.url, /링크를 입력하거나 파일을 첨부/);
+  assert.equal((await submit(assignment.slug, { studentId: '20303', name: '박서연', url: ' ', file: null })).status, 400);
+
+  // 제출 확인에서도 파일 이름이 보인다.
+  const found = await request('POST', `/api/assignments/${assignment.slug}/lookup`, { body: { studentId: '20301', password: 'pass1234' } });
+  assert.deepEqual(found.json.submission.file, { name: '벽돌_깨기.html', size: 1_300_000 });
+
+  const rows = await listSubmissions(cookie, assignment);
+  assert.deepEqual(
+    rows.map((row) => [row.studentId, row.url, row.file && [row.file.name, row.file.size, row.file.chunks]]),
+    [
+      ['20301', '', ['벽돌_깨기.html', 1_300_000, 3]],
+      ['20302', 'https://example.com/lee', ['index.html', small.length, 1]],
+    ],
+  );
+  assert.ok((await download(cookie, rows[0].file)).equals(game), '여러 조각으로 나뉜 파일이 그대로 돌아온다');
+  assert.ok((await download(cookie, rows[1].file)).equals(small));
+
+  // 파일은 로그인한 선생님만 받을 수 있다.
+  assert.equal((await fetch(`${base}/api/admin/files/${rows[0].file.id}/chunks/0`)).status, 401);
+  assert.equal((await request('GET', `/api/admin/files/${rows[0].file.id}/chunks/3`, { cookie })).status, 404);
+  assert.equal((await request('GET', '/api/admin/files/999/chunks/0', { cookie })).status, 404);
+
+  const overview = await request('GET', '/api/admin/overview', { cookie });
+  assert.deepEqual(overview.json.files, { usedBytes: 1_300_000 + small.length, limitBytes: 1024 * 1024 * 1024, maxFileBytes: 10 * 1024 * 1024 });
+});
+
+test('파일 첨부: 고칠 때 그대로 두거나, 다른 파일로 바꾸거나, 뺄 수 있다', async (t) => {
+  const { app, request, login, createAssignment, submit, upload, download, listSubmissions, clock } = await start(t);
+  const cookie = await login();
+  const assignment = await createAssignment(cookie, { dueAt: '2026-11-15T06:00:00.000Z' });
+  const first = randomBytes(600_000);
+  const second = randomBytes(20_000);
+
+  assert.equal((await submit(assignment.slug, { file: await upload(assignment.slug, 'v1.zip', first) })).status, 201);
+  const [before] = await listSubmissions(cookie, assignment);
+
+  // file 을 보내지 않으면 첨부는 그대로다. 이름이나 메모만 고친 것은 새 제출로 치지 않는다.
+  clock.now = new Date('2026-11-15T04:00:00.000Z');
+  const kept = await submit(assignment.slug, { note: '메모만 고침' });
+  assert.equal(kept.json.status, 'updated');
+  assert.equal(kept.json.submission.revision, 1);
+  assert.equal(kept.json.submission.updatedAt, '2026-11-15T03:00:00.000Z');
+  assert.deepEqual(kept.json.submission.file, { name: 'v1.zip', size: 600_000 });
+  assert.equal((await submit(assignment.slug, { note: '메모만 고침' })).json.status, 'unchanged');
+
+  // 다른 파일로 바꾸면 새 제출이 되고(마감 뒤라면 지각), 이전 파일은 이름만 기록에 남고 내용은 지워진다.
+  clock.now = new Date('2026-11-15T07:00:00.000Z');
+  const replaced = await submit(assignment.slug, { note: '메모만 고침', file: await upload(assignment.slug, 'v2.zip', second) });
+  assert.equal(replaced.status, 200, replaced.text);
+  assert.equal(replaced.json.status, 'updated');
+  assert.equal(replaced.json.submission.revision, 2);
+  assert.equal(replaced.json.submission.updatedAt, '2026-11-15T07:00:00.000Z');
+  assert.equal(replaced.json.submission.isLate, true);
+  assert.deepEqual(replaced.json.submission.file, { name: 'v2.zip', size: 20_000 });
+  const [after] = await listSubmissions(cookie, assignment);
+  assert.ok((await download(cookie, after.file)).equals(second));
+  assert.equal((await request('GET', `/api/admin/files/${before.file.id}/chunks/0`, { cookie })).status, 404);
+  assert.equal(await app.store.countChunks(before.file.id), 0);
+  assert.equal(await app.store.fileBytes(), 20_000);
+
+  // 파일을 빼려면 링크가 있어야 한다. 빼는 것도 새 제출이다.
+  const emptied = await submit(assignment.slug, { url: '', file: null });
+  assert.equal(emptied.status, 400);
+  assert.match(emptied.json.error.fields.url, /링크를 입력하거나 파일을 첨부/);
+  const removed = await submit(assignment.slug, { url: 'https://example.com/instead', file: null });
+  assert.equal(removed.json.status, 'updated');
+  assert.equal(removed.json.submission.revision, 3);
+  assert.equal(removed.json.submission.file, null);
+  assert.equal(await app.store.fileBytes(), 0);
+
+  const detail = await request('GET', `/api/admin/submissions/${after.id}`, { cookie });
+  assert.deepEqual(
+    detail.json.submission.history.map((entry) => [entry.url, entry.fileName, entry.submittedAt]),
+    [
+      ['https://example.com/work', 'v2.zip', '2026-11-15T07:00:00.000Z'],
+      ['https://example.com/work', 'v1.zip', '2026-11-15T03:00:00.000Z'],
+    ],
+  );
+});
+
+test('파일 올리기: 받지 않는 과제, 큰 파일, 실행 파일, 가득 찬 저장 공간, 잘못된 조각은 거절한다', async (t) => {
+  const limits = { maxFileBytes: 700_000, fileStorageBytes: 1_500_000 };
+  const { app, request, login, createAssignment, submit, upload, putChunk } = await start(t, { limits });
+  const cookie = await login();
+  const open = await createAssignment(cookie, { title: '파일 받음' });
+  const noFiles = await createAssignment(cookie, { title: '링크만', allowFiles: false });
+  const closed = await createAssignment(cookie, { title: '닫힘', isOpen: false });
+  const begin = (slug, body) => request('POST', `/api/assignments/${slug}/uploads`, { body });
+
+  assert.equal((await request('GET', '/api/site')).json.maxFileBytes, 700_000);
+  assert.equal((await begin(noFiles.slug, { name: 'a.txt', size: 10 })).json.error.code, 'files_off');
+  assert.equal((await begin(closed.slug, { name: 'a.txt', size: 10 })).json.error.code, 'closed');
+  assert.equal((await begin('nosuchslug', { name: 'a.txt', size: 10 })).status, 404);
+  for (const [body, reason] of [
+    [{ name: 'game.exe', size: 10 }, /\.exe 파일은 올릴 수 없습니다/],
+    [{ name: 'a.txt', size: 0 }, /빈 파일/],
+    [{ name: 'a.txt', size: 700_001 }, /파일이 너무 큽니다/],
+    [{ name: 'a.txt', size: 1.5 }, /읽을 수 없습니다/],
+    [{ name: 'a.txt', size: '10' }, /읽을 수 없습니다/],
+    [{ name: ' .. ', size: 10 }, /파일 이름/],
+    [{ size: 10 }, /파일 이름/],
+  ]) {
+    const refused = await begin(open.slug, body);
+    assert.equal(refused.status, 400, JSON.stringify(body));
+    assert.match(refused.json.error.fields.file, reason);
+  }
+
+  // 파일을 받지 않는 과제에는 다른 과제에 올린 파일도 붙일 수 없고, 링크가 꼭 있어야 한다.
+  const elsewhere = await upload(open.slug, 'a.txt', Buffer.from('hello'));
+  const smuggled = await submit(noFiles.slug, { file: elsewhere });
+  assert.equal(smuggled.status, 400);
+  assert.match(smuggled.json.error.fields.file, /파일을 받지 않습니다/);
+  assert.match((await submit(noFiles.slug, { url: '' })).json.error.fields.url, /^과제 링크를 입력하세요/);
+  // 다른 과제에 올린 파일은 붙일 수 없다.
+  const other = await createAssignment(cookie, { title: '다른 과제' });
+  assert.match((await submit(other.slug, { file: elsewhere })).json.error.fields.file, /찾을 수 없습니다/);
+
+  // 조각: 토큰이 맞아야 하고, 순서와 크기가 처음 알린 대로여야 하고, 파일 내용 형식으로 보내야 한다.
+  const content = randomBytes(600_000);
+  const started = await begin(open.slug, { name: 'b.bin', size: content.length });
+  const { uploadId, token, chunkSize, chunks } = started.json;
+  assert.deepEqual([chunkSize, chunks], [512 * 1024, 2]);
+  const head = content.subarray(0, chunkSize);
+  const tail = content.subarray(chunkSize);
+  assert.equal((await putChunk(uploadId, 'wrong-token', 0, head)).status, 404);
+  assert.equal((await putChunk(uploadId, '', 0, head)).status, 404);
+  assert.equal((await putChunk(uploadId + 100, token, 0, head)).status, 404);
+  assert.equal((await putChunk(uploadId, token, 2, tail)).status, 400);
+  assert.equal((await putChunk(uploadId, token, 0, tail)).status, 400, '크기가 다른 조각');
+  assert.equal((await putChunk(uploadId, token, 1, head)).status, 413, '마지막 조각 자리에 너무 큰 조각');
+  assert.equal((await putChunk(uploadId, token, 0, head, { 'Content-Type': 'application/json' })).status, 415);
+  assert.equal((await putChunk(uploadId, token, 0, head, { 'Sec-Fetch-Site': 'cross-site' })).status, 403);
+  assert.equal((await putChunk(uploadId, token, 0, head)).status, 200);
+
+  // 다 올리지 않은 파일, 틀린 토큰으로는 제출할 수 없다.
+  const partial = await submit(open.slug, { file: { uploadId, token } });
+  assert.equal(partial.status, 400);
+  assert.match(partial.json.error.fields.file, /찾을 수 없습니다/);
+  assert.equal((await putChunk(uploadId, token, 1, tail)).status, 200);
+  // 같은 조각을 다시 보내도(응답을 못 받고 다시 시도) 괜찮고, 처음 받은 내용이 남는다.
+  assert.equal((await putChunk(uploadId, token, 0, randomBytes(chunkSize))).status, 200);
+  for (const file of [{ uploadId, token: 'wrong-token' }, { uploadId: 'x', token }, { uploadId }, 'nope', 7]) {
+    assert.equal((await submit(open.slug, { file })).status, 400, JSON.stringify(file));
+  }
+  assert.equal((await submit(open.slug, { file: { uploadId, token } })).status, 201);
+  // 이미 제출에 붙은 파일은 다른 제출에 다시 붙이거나, 조각을 더 보내거나, 취소할 수 없다.
+  assert.equal((await submit(open.slug, { studentId: '20302', name: '이도윤', file: { uploadId, token } })).status, 400);
+  assert.equal((await putChunk(uploadId, token, 0, head)).status, 404);
+  assert.equal((await request('DELETE', `/api/uploads/${uploadId}`, { headers: { 'X-Upload-Token': token } })).status, 404);
+
+  // 받아 둔 파일의 합이 한도를 넘게 되면 더 받지 않는다. (지금 600,000 + 5 바이트)
+  const second = await begin(open.slug, { name: 'c.bin', size: 700_000 });
+  assert.equal(second.status, 201);
+  const full = await begin(open.slug, { name: 'd.bin', size: 300_000 });
+  assert.equal(full.status, 403);
+  assert.equal(full.json.error.code, 'storage_full');
+
+  // 올리던 것을 취소하면 자리가 다시 난다.
+  const cancel = (id, uploadToken) => request('DELETE', `/api/uploads/${id}`, { headers: { 'X-Upload-Token': uploadToken } });
+  assert.equal((await cancel(second.json.uploadId, 'wrong-token')).status, 404);
+  assert.equal((await cancel(second.json.uploadId, second.json.token)).status, 200);
+  assert.equal((await cancel(second.json.uploadId, second.json.token)).status, 404);
+  assert.equal((await begin(open.slug, { name: 'd.bin', size: 300_000 })).status, 201);
+  assert.equal(await app.store.fileBytes(), 600_000 + 5 + 300_000);
+});
+
+test('올려 놓고 제출하지 않은 파일은 한 시간 뒤에 지워진다', async (t) => {
+  const { app, request, login, createAssignment, submit, upload, clock } = await start(t);
+  const cookie = await login();
+  const assignment = await createAssignment(cookie);
+
+  const abandoned = await upload(assignment.slug, 'left.bin', randomBytes(600_000));
+  const used = await upload(assignment.slug, 'used.bin', randomBytes(1000));
+  assert.equal((await submit(assignment.slug, { file: used })).status, 201);
+  assert.equal(await app.store.fileBytes(), 601_000);
+
+  clock.now = new Date(clock.now.getTime() + 59 * 60 * 1000);
+  await request('GET', '/api/site');
+  assert.equal(await app.store.fileBytes(), 601_000, '한 시간이 지나기 전에는 남아 있다');
+
+  clock.now = new Date(clock.now.getTime() + 2 * 60 * 1000);
+  await request('GET', '/api/site');
+  assert.equal(await app.store.fileBytes(), 1000, '제출에 붙은 파일은 남는다');
+  assert.equal(await app.store.countChunks(abandoned.uploadId), 0);
+  const late = await submit(assignment.slug, { studentId: '20302', name: '이도윤', file: abandoned });
+  assert.equal(late.status, 400);
+  assert.match(late.json.error.fields.file, /찾을 수 없습니다/);
+});
+
+test('제출이나 과제를 지우면 첨부 파일도 지워진다', async (t) => {
+  const { app, request, login, createAssignment, submit, upload, listSubmissions } = await start(t);
+  const cookie = await login();
+  const assignment = await createAssignment(cookie);
+  const kept = await createAssignment(cookie, { title: '남길 과제' });
+
+  await submit(assignment.slug, { file: await upload(assignment.slug, 'a.bin', randomBytes(600_000)) });
+  await submit(assignment.slug, { studentId: '20302', name: '이도윤', file: await upload(assignment.slug, 'b.bin', randomBytes(2000)) });
+  const pending = await upload(assignment.slug, 'pending.bin', randomBytes(3000));
+  await submit(kept.slug, { file: await upload(kept.slug, 'c.bin', randomBytes(4000)) });
+  const rows = await listSubmissions(cookie, assignment);
+  assert.equal(await app.store.fileBytes(), 609_000);
+
+  assert.equal((await request('DELETE', `/api/admin/submissions/${rows[0].id}`, { cookie })).status, 200);
+  assert.equal(await app.store.fileBytes(), 9000);
+  assert.equal(await app.store.countChunks(rows[0].file.id), 0);
+
+  // 과제를 지우면 그 과제에 올리던 파일까지 모두 지워지고, 다른 과제의 파일은 남는다.
+  assert.equal((await request('DELETE', `/api/admin/assignments/${assignment.id}`, { cookie })).status, 200);
+  assert.equal(await app.store.fileBytes(), 4000);
+  assert.equal(await app.store.countChunks(rows[1].file.id), 0);
+  assert.equal(await app.store.countChunks(pending.uploadId), 0);
+  const [left] = await listSubmissions(cookie, kept);
+  assert.equal(left.file.name, 'c.bin');
+  assert.equal(await app.store.countChunks(left.file.id), 1);
+});
+
+test('파일을 받지 않게 바꿔도 이미 낸 파일은 남고, 파일 설정은 따로 보내지 않으면 그대로다', async (t) => {
+  const { request, login, createAssignment, submit, upload } = await start(t);
+  const cookie = await login();
+  const assignment = await createAssignment(cookie);
+  await submit(assignment.slug, { url: '', file: await upload(assignment.slug, 'a.txt', Buffer.from('hello')) });
+
+  const off = await request('PUT', `/api/admin/assignments/${assignment.id}`, { cookie, body: { title: '1차 과제', allowFiles: false } });
+  assert.equal(off.json.assignment.allowFiles, false);
+  // 이 항목을 모르는 예전 화면이 보낸 수정 요청은 설정을 바꾸지 않는다.
+  const untouched = await request('PUT', `/api/admin/assignments/${assignment.id}`, { cookie, body: { title: '1차 과제' } });
+  assert.equal(untouched.json.assignment.allowFiles, false);
+
+  // 이미 낸 학생은 파일을 그대로 둔 채 다른 내용을 고칠 수 있지만, 새 파일은 올릴 수 없다.
+  const edited = await submit(assignment.slug, { url: '', note: '메모 추가' });
+  assert.equal(edited.status, 200, edited.text);
+  assert.deepEqual(edited.json.submission.file, { name: 'a.txt', size: 5 });
+  assert.equal((await request('POST', `/api/assignments/${assignment.slug}/uploads`, { body: { name: 'b.txt', size: 5 } })).status, 403);
 });
 
 test('같은 학번으로 동시에 처음 제출하면 하나만 받아들인다', async (t) => {

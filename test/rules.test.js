@@ -3,9 +3,12 @@ import test from 'node:test';
 
 import {
   LIMITS,
+  checkFile,
   compareStudentIds,
+  formatBytes,
   multiLine,
   nameKey,
+  normalizeFileName,
   normalizeStudentId,
   normalizeUrl,
   parseRosterText,
@@ -105,6 +108,58 @@ test('학번을 꼭 받지 않는 과제에서는 비워 둔 학번도 받는다
   assert.ok(validateSubmission({ ...rest, name: ' ' }, { requireStudentId: false }).errors.name);
 });
 
+test('파일을 첨부한 제출은 링크를 비워 둘 수 있다', () => {
+  const rest = { studentId: '20301', name: '김하늘', password: 'pass1234' };
+  assert.ok(validateSubmission({ ...rest, url: '' }).errors.url, '따로 정하지 않으면 링크는 필수');
+
+  const blank = validateSubmission({ ...rest, url: '  ' }, { urlOptional: true });
+  assert.equal(blank.errors, null);
+  assert.equal(blank.value.url, '');
+  assert.equal(validateSubmission(rest, { urlOptional: true }).errors, null, '링크 항목이 아예 없어도 된다');
+
+  // 적었다면 똑같이 다듬고 검사한다.
+  assert.equal(validateSubmission({ ...rest, url: 'example.com/a' }, { urlOptional: true }).value.url, 'https://example.com/a');
+  assert.ok(validateSubmission({ ...rest, url: 'javascript:alert(1)' }, { urlOptional: true }).errors.url);
+  assert.ok(validateSubmission({ ...rest, url: ' '.repeat(9000) }, { urlOptional: true }).errors.url, '터무니없이 긴 입력은 빈칸뿐이어도 받지 않는다');
+});
+
+test('첨부 파일 이름은 폴더 구분 글자와 쓸 수 없는 글자를 바꾸고, 너무 길면 확장자를 남기고 자른다', () => {
+  assert.equal(normalizeFileName(' 내 과제.html '), '내 과제.html');
+  assert.equal(normalizeFileName('../../etc/passwd'), '_.._etc_passwd');
+  assert.equal(normalizeFileName('C:\\Users\\me\\a<b>.txt'), 'C__Users_me_a_b_.txt');
+  assert.equal(normalizeFileName('..숨김.txt.'), '숨김.txt');
+  assert.equal(normalizeFileName('줄\n바꿈\u200B.txt'), '줄 바꿈.txt');
+  assert.equal(normalizeFileName(' .. '), '');
+  assert.equal(normalizeFileName(undefined), '');
+  assert.equal(normalizeFileName(42), '42');
+
+  const long = normalizeFileName(`${'가'.repeat(300)}.pptx`);
+  assert.equal(long.length, LIMITS.fileName);
+  assert.ok(long.endsWith('.pptx'));
+  assert.equal(normalizeFileName('x'.repeat(5000)).length, LIMITS.fileName);
+});
+
+test('첨부 파일 검사: 실행 파일, 빈 파일, 너무 큰 파일은 받지 않는다', () => {
+  const limit = 10 * 1024 * 1024;
+  assert.equal(checkFile('game.html', 1200, limit), null);
+  assert.equal(checkFile('사진.JPG', limit, limit), null);
+  assert.equal(checkFile('확장자없음', 10, limit), null);
+  assert.match(checkFile('', 10, limit), /파일 이름/);
+  assert.match(checkFile('setup.EXE', 10, limit), /\.exe 파일은 올릴 수 없습니다/);
+  assert.match(checkFile('run.bat', 10, limit), /\.bat/);
+  assert.equal(checkFile('game.exe.zip', 10, limit), null, '압축한 것은 받는다');
+  assert.match(checkFile('a.txt', 0, limit), /빈 파일/);
+  assert.match(checkFile('a.txt', limit + 1, limit), /10MB까지/);
+  for (const size of [-1, 1.5, '10', null, undefined, Number.NaN]) assert.match(checkFile('a.txt', size, limit), /읽을 수 없습니다/);
+});
+
+test('파일 크기는 읽기 쉬운 단위로 보여 준다', () => {
+  assert.deepEqual(
+    [0, 500, 1024, 820 * 1024, 3.44 * 1024 * 1024, 10 * 1024 * 1024, 250 * 1024 * 1024, 1024 ** 3, 1.5 * 1024 ** 3].map(formatBytes),
+    ['0B', '500B', '1KB', '820KB', '3.4MB', '10MB', '250MB', '1GB', '1.5GB'],
+  );
+});
+
 test('이름으로 구분할 때는 띄어쓰기·대소문자·전각 차이를 무시한다', () => {
   assert.equal(nameKey(' 홍 길동 '), '홍길동');
   assert.equal(nameKey('Hong  Gildong'), nameKey('hong gildong'));
@@ -148,7 +203,9 @@ test('과제 검사: 제목은 필수, 마감 일시는 시간대가 붙은 값�
     allowLate: false,
     isOpen: true,
     requireStudentId: true,
+    allowFiles: true,
   });
+  assert.equal(validateAssignment({ title: '과제', allowFiles: false }).value.allowFiles, false);
   assert.equal(validateAssignment({ title: '과제', requireStudentId: false }).value.requireStudentId, false);
   assert.equal(validateAssignment({ title: '과제', dueAt: '' }).value.dueAt, null);
   assert.equal(validateAssignment({ title: '과제', dueAt: null }).value.dueAt, null);
@@ -202,15 +259,17 @@ test('CSV 표: 제출한 학생 뒤에 미제출 학생이 붙는다', () => {
       submissions: [
         { studentId: '20301', name: '김하늘', isLate: false, url: 'https://a.example/1', note: '', updatedAt: 'U1', createdAt: 'C1', revision: 1 },
         { studentId: '20302', name: '이도윤', isLate: true, url: 'https://a.example/2', note: '늦었습니다', updatedAt: 'U2', createdAt: 'C2', revision: 3 },
+        { studentId: '', name: '최지우', isLate: false, url: '', file: { name: 'game.html', size: 1200 }, note: '', updatedAt: 'U3', createdAt: 'C3', revision: 1 },
       ],
       missing: [{ studentId: '20303', name: '박서연' }],
     },
     (value) => `t:${value}`,
   );
   assert.deepEqual(rows, [
-    ['학번', '이름', '상태', '링크', '메모', '제출 시각', '처음 제출한 시각', '제출 횟수'],
-    ['20301', '김하늘', '제출', 'https://a.example/1', '', 't:U1', 't:C1', 1],
-    ['20302', '이도윤', '지각', 'https://a.example/2', '늦었습니다', 't:U2', 't:C2', 3],
-    ['20303', '박서연', '미제출', '', '', '', '', 0],
+    ['학번', '이름', '상태', '링크', '파일', '메모', '제출 시각', '처음 제출한 시각', '제출 횟수'],
+    ['20301', '김하늘', '제출', 'https://a.example/1', '', '', 't:U1', 't:C1', 1],
+    ['20302', '이도윤', '지각', 'https://a.example/2', '', '늦었습니다', 't:U2', 't:C2', 3],
+    ['', '최지우', '제출', '', 'game.html', '', 't:U3', 't:C3', 1],
+    ['20303', '박서연', '미제출', '', '', '', '', '', 0],
   ]);
 });

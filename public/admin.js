@@ -1,7 +1,21 @@
 // 관리 화면: 과제 만들기, 제출 현황, 미제출자, 명단·설정
 
-import { api, copyText, dueBadge, dueText, externalLink, field, fill, formatDateTime, formatTimestamp, h, richText, toast } from './ui.js';
-import { LIMITS, compareStudentIds, parseRosterText } from './shared/rules.js';
+import {
+  api,
+  copyText,
+  dueBadge,
+  dueText,
+  externalLink,
+  fetchBytes,
+  field,
+  fill,
+  formatDateTime,
+  formatTimestamp,
+  h,
+  richText,
+  toast,
+} from './ui.js';
+import { LIMITS, compareStudentIds, formatBytes, parseRosterText } from './shared/rules.js';
 import { submissionTable, toCsv } from './shared/csv.js';
 
 const app = document.getElementById('app');
@@ -10,7 +24,7 @@ const REFRESH_MS = 20 * 1000;
 const state = {
   setup: 'console', // 관리자 비밀번호를 처음 정하는 방법: 'console'(서버 실행 창) | 'web'(이 화면)
   view: 'assignments', // 'assignments' | 'settings'
-  overview: null, // { title, rosterCount, passwordFromEnv, assignments }
+  overview: null, // { title, rosterCount, passwordFromEnv, files, assignments }
   selectedId: null,
   detail: null, // 선택한 과제의 { assignment, submissions, missing, rosterCount }
   roster: null, // 설정 화면에서만 불러옵니다.
@@ -278,6 +292,7 @@ function panel(detail) {
         h('span', {}, dueText(assignment)),
         latePolicy ? h('span', { class: 'muted' }, `· ${latePolicy}`) : null,
         !assignment.requireStudentId ? h('span', { class: 'muted' }, '· 학번 없이도 제출 가능') : null,
+        !assignment.allowFiles ? h('span', { class: 'muted' }, '· 파일은 받지 않음') : null,
         !assignment.isOpen ? h('span', { class: 'muted' }, '· 직접 닫음') : null,
       ),
       assignment.description ? h('p', { class: 'description' }, richText(assignment.description)) : null,
@@ -358,6 +373,7 @@ function panel(detail) {
     }),
     sort,
     button('CSV 내려받기', () => downloadCsv(detail), 'secondary', { disabled: !detail.submissions.length && !detail.missing.length }),
+    detail.submissions.some((submission) => submission.file) ? button('파일 모두 내려받기', (event) => downloadAllFiles(detail, event.currentTarget)) : null,
   );
 
   return [head, share, stats, toolbar, tableHost, missingSection(detail)];
@@ -399,7 +415,7 @@ function submissionsTable(detail) {
           { role: 'row' },
           heading('학번', 'col-id'),
           heading('이름', 'col-name'),
-          heading('링크 · 메모', 'col-link'),
+          heading(detail.submissions.some((submission) => submission.file) ? '링크 · 파일 · 메모' : '링크 · 메모', 'col-link'),
           heading('제출 시각', 'col-time'),
           heading(h('span', { class: 'sr-only' }, '자세히'), 'col-action'),
         ),
@@ -413,13 +429,34 @@ function linkCell(url) {
   return externalLink(url, url.replace(/^https?:\/\//, ''), 'link');
 }
 
+// 첨부 파일 이름. 누르면 내려받습니다.
+function fileButton(submission) {
+  return h(
+    'button',
+    {
+      class: 'file-link',
+      type: 'button',
+      title: '눌러서 내려받기',
+      onclick: (event) => downloadFile(submission, event.currentTarget),
+    },
+    h('span', { class: 'file-name' }, submission.file.name),
+    h('span', { class: 'file-size' }, formatBytes(submission.file.size)),
+  );
+}
+
 function submissionRow(submission, detail) {
   return h(
     'tr',
     { role: 'row' },
     h('td', { class: 'cell-id', role: 'cell' }, submission.studentId || h('span', { class: 'cell-meta', title: '학번 없이 제출' }, '—')),
     h('td', { class: 'cell-name', role: 'cell' }, h('div', { class: 'cell-stack' }, h('span', {}, submission.name), rosterFlag(submission, detail))),
-    h('td', { class: 'cell-link', role: 'cell' }, linkCell(submission.url), submission.note ? h('p', { class: 'cell-note' }, submission.note) : null),
+    h(
+      'td',
+      { class: 'cell-link', role: 'cell' },
+      submission.url ? linkCell(submission.url) : null,
+      submission.file ? fileButton(submission) : null,
+      submission.note ? h('p', { class: 'cell-note' }, submission.note) : null,
+    ),
     h(
       'td',
       { class: 'cell-time', role: 'cell' },
@@ -462,7 +499,8 @@ function openSubmissionDialog(submission, detail) {
     h(
       'dl',
       { class: 'detail-rows' },
-      row('링크', externalLink(submission.url, submission.url, 'detail-link')),
+      submission.url ? row('링크', externalLink(submission.url, submission.url, 'detail-link')) : null,
+      submission.file ? row('파일', fileButton(submission)) : null,
       submission.note ? row('메모', h('span', { class: 'detail-note' }, submission.note)) : null,
       row('제출 시각', h('span', { class: 'time' }, formatDateTime(submission.updatedAt)), submission.isLate ? chip('지각', 'late') : null),
       submission.revision > 1 ? row('처음 제출', h('span', { class: 'time' }, formatDateTime(submission.createdAt))) : null,
@@ -501,7 +539,9 @@ function openSubmissionDialog(submission, detail) {
                 'li',
                 {},
                 h('span', { class: 'history-when' }, h('span', { class: 'time' }, formatDateTime(entry.submittedAt)), entry.isLate ? chip('지각', 'late') : null),
-                externalLink(entry.url, entry.url, 'detail-link'),
+                entry.url ? externalLink(entry.url, entry.url, 'detail-link') : null,
+                // 이전 파일은 이름만 남아 있습니다.
+                entry.fileName ? h('span', { class: 'muted' }, `파일: ${entry.fileName} (바꾸면서 지워짐)`) : null,
                 entry.note ? h('span', { class: 'detail-note muted' }, entry.note) : null,
               ),
             ),
@@ -563,13 +603,78 @@ function downloadCsv(detail) {
     formatTimestamp,
   );
   const blob = new Blob([toCsv(rows)], { type: 'text/csv;charset=utf-8' });
+  saveBlob(blob, `${safeName(detail.assignment.title).slice(0, 60) || '과제'}_제출현황_${formatTimestamp(new Date().toISOString()).slice(0, 10)}.csv`);
+}
+
+// 파일 이름에 쓸 수 없는 글자를 _ 로 바꿉니다.
+function safeName(text) {
+  return text.replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_').trim();
+}
+
+// 브라우저의 내려받기로 저장합니다.
+function saveBlob(blob, name) {
   const url = URL.createObjectURL(blob);
-  const safeTitle = detail.assignment.title.replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_').trim().slice(0, 60) || '과제';
-  const anchor = h('a', { href: url, download: `${safeTitle}_제출현황_${formatTimestamp(new Date().toISOString()).slice(0, 10)}.csv` });
+  const anchor = h('a', { href: url, download: name });
   document.body.append(anchor);
   anchor.click();
   anchor.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 10 * 1000);
+  setTimeout(() => URL.revokeObjectURL(url), 60 * 1000);
+}
+
+// 첨부 파일을 조각으로 받아 하나로 합칩니다. (한 번에 받을 수 있는 크기에 한도가 있는 서버에서도 큰 파일을 받을 수 있게)
+// 학생이 올린 내용이므로 화면에 열지 않고 항상 파일로 저장합니다. 누가 낸 것인지 알 수 있게 이름 앞에 학번과 이름을 붙입니다.
+async function fetchFile(submission) {
+  const { id, chunks } = submission.file;
+  const parts = new Array(chunks);
+  let next = 0;
+  async function worker() {
+    while (next < chunks) {
+      const seq = next;
+      next += 1;
+      parts[seq] = await fetchBytes(`/api/admin/files/${id}/chunks/${seq}`);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(3, chunks) }, worker));
+  return new Blob(parts, { type: 'application/octet-stream' });
+}
+
+const downloadName = (submission) => safeName(`${who(submission).replace(/\s+/g, '_')}_${submission.file.name}`);
+
+function reportDownload(error) {
+  if (error.status === 401 && state.overview) leave('로그인 시간이 지났습니다. 다시 로그인해 주세요.');
+  else toast(error.status === 404 ? '파일을 찾을 수 없습니다. 학생이 방금 다른 파일로 바꿨을 수 있습니다.' : error.message, 'error');
+}
+
+async function downloadFile(submission, trigger) {
+  if (trigger) trigger.disabled = true;
+  try {
+    saveBlob(await fetchFile(submission), downloadName(submission));
+  } catch (error) {
+    reportDownload(error);
+  } finally {
+    if (trigger) trigger.disabled = false;
+  }
+}
+
+// 파일을 낸 학생 모두의 파일을 차례로 저장합니다.
+async function downloadAllFiles(detail, trigger) {
+  const withFile = detail.submissions.filter((submission) => submission.file).sort(byStudentId);
+  const label = trigger.textContent;
+  trigger.disabled = true;
+  try {
+    for (const [index, submission] of withFile.entries()) {
+      trigger.textContent = `내려받는 중… ${index + 1}/${withFile.length}`;
+      saveBlob(await fetchFile(submission), downloadName(submission));
+      // 브라우저가 연달아 저장하는 파일을 놓치지 않게 잠깐 쉽니다.
+      await new Promise((resolve) => setTimeout(resolve, 400));
+    }
+    toast(`파일 ${withFile.length}개를 내려받았습니다. 일부만 저장되었다면 브라우저에서 "여러 파일 다운로드"를 허용해 주세요.`);
+  } catch (error) {
+    reportDownload(error);
+  } finally {
+    trigger.textContent = label;
+    trigger.disabled = false;
+  }
 }
 
 // ── 과제·제출 고치기 ────────────────────────────────────────────────────────
@@ -582,6 +687,7 @@ async function toggleOpen(assignment) {
       dueAt: assignment.dueAt,
       allowLate: assignment.allowLate,
       requireStudentId: assignment.requireStudentId,
+      allowFiles: assignment.allowFiles,
       isOpen: !assignment.isOpen,
     });
     toast(assignment.isOpen ? '제출을 닫았습니다.' : '다시 제출을 받습니다.');
@@ -719,6 +825,11 @@ function openAssignmentDialog(existing) {
     id: 'assignment-student-id',
     checked: existing ? existing.requireStudentId : (state.overview?.assignments[0]?.requireStudentId ?? true),
   });
+  const allowFiles = h('input', {
+    type: 'checkbox',
+    id: 'assignment-files',
+    checked: existing ? existing.allowFiles : (state.overview?.assignments[0]?.allowFiles ?? true),
+  });
   const message = h('p', { class: 'form-message', role: 'alert', hidden: true });
   const save = h('button', { class: 'button button-primary', type: 'submit' }, existing ? '저장' : '과제 만들기');
   const fields = { title, description, dueAt: due };
@@ -748,6 +859,7 @@ function openAssignmentDialog(existing) {
           dueAt,
           allowLate: allowLate.checked,
           requireStudentId: requireStudentId.checked,
+          allowFiles: allowFiles.checked,
           isOpen: existing ? existing.isOpen : true,
         };
 
@@ -791,6 +903,21 @@ function openAssignmentDialog(existing) {
       requireStudentId,
       h('span', {}, '학번 필수 입력', h('span', { class: 'check-note' }, '끄면 학번을 비워 두고도 낼 수 있습니다. 학번 없이 낸 제출은 이름으로 구분합니다.')),
     ),
+    h(
+      'label',
+      { class: 'check', for: 'assignment-files' },
+      allowFiles,
+      h(
+        'span',
+        {},
+        '파일 첨부 받기',
+        h(
+          'span',
+          { class: 'check-note' },
+          `학생이 링크 대신, 또는 링크와 함께 파일을 하나(${formatBytes(state.overview?.files?.maxFileBytes ?? 10 * 1024 * 1024)}까지) 낼 수 있습니다.`,
+        ),
+      ),
+    ),
     message,
     h('div', { class: 'dialog-actions' }, button('취소', () => dialog.close()), save),
   );
@@ -806,7 +933,27 @@ function settingsCard(title, ...content) {
 }
 
 function settingsView() {
-  return h('main', { class: 'settings' }, siteSettings(), rosterSettings(), passwordSettings());
+  return h('main', { class: 'settings' }, siteSettings(), rosterSettings(), fileSettings(), passwordSettings());
+}
+
+// 받아 둔 첨부 파일이 차지한 공간. 과제나 제출을 지우면 파일도 지워져서 공간이 다시 납니다.
+function fileSettings() {
+  const { usedBytes, limitBytes, maxFileBytes } = state.overview.files;
+  const percent = Math.min(100, Math.round((usedBytes / limitBytes) * 100));
+  return settingsCard(
+    '첨부 파일',
+    h(
+      'p',
+      { class: 'settings-lead' },
+      `학생들이 낸 파일이 지금 ${formatBytes(usedBytes)}를 차지하고 있습니다. 모두 합쳐 ${formatBytes(limitBytes)}까지 받을 수 있습니다(${percent}% 사용).`,
+    ),
+    h('progress', { class: 'usage', max: 100, value: percent, 'aria-label': '첨부 파일 저장 공간 사용량' }),
+    h(
+      'p',
+      { class: 'hint' },
+      `파일 하나는 ${formatBytes(maxFileBytes)}까지 받습니다. 공간이 차면 새 파일을 받지 못하니, 끝난 과제는 파일을 내려받은 뒤 삭제해 주세요. 과제를 삭제하면 그 과제의 파일도 함께 지워집니다.`,
+    ),
+  );
 }
 
 function siteSettings() {

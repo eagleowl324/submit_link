@@ -32,20 +32,15 @@ export class ApiError extends Error {
   }
 }
 
-export async function api(method, path, body) {
-  let response;
+async function send(path, options) {
   try {
-    response = await fetch(path, {
-      method,
-      // 서버는 내용을 바꾸는 요청을 본문이 없어도 JSON 형식일 때만 받습니다(다른 사이트가 흉내 낼 수 없는 형식).
-      headers: method === 'GET' ? {} : { 'Content-Type': 'application/json' },
-      body: body === undefined ? undefined : JSON.stringify(body),
-      credentials: 'same-origin',
-      cache: 'no-store',
-    });
+    return await fetch(path, { credentials: 'same-origin', cache: 'no-store', ...options });
   } catch {
     throw new ApiError(0, { error: { code: 'network', message: '서버에 연결하지 못했습니다. 인터넷 연결을 확인하고 다시 시도해 주세요.' } });
   }
+}
+
+async function readJson(response) {
   let data = null;
   try {
     data = await response.json();
@@ -54,6 +49,28 @@ export async function api(method, path, body) {
   }
   if (!response.ok) throw new ApiError(response.status, data);
   return data;
+}
+
+export async function api(method, path, body, headers = {}) {
+  const response = await send(path, {
+    method,
+    // 서버는 내용을 바꾸는 요청을 본문이 없어도 JSON 형식일 때만 받습니다(다른 사이트가 흉내 낼 수 없는 형식).
+    headers: { ...(method === 'GET' ? {} : { 'Content-Type': 'application/json' }), ...headers },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  return readJson(response);
+}
+
+// 파일 내용처럼 JSON 이 아닌 본문을 보냅니다. bytes 는 Blob 이나 ArrayBuffer.
+export async function sendBytes(method, path, bytes, headers = {}) {
+  return readJson(await send(path, { method, headers: { 'Content-Type': 'application/octet-stream', ...headers }, body: bytes }));
+}
+
+// JSON 이 아닌 내용(파일 조각)을 받아 ArrayBuffer 로 돌려줍니다.
+export async function fetchBytes(path) {
+  const response = await send(path, { method: 'GET' });
+  if (!response.ok) await readJson(response);
+  return response.arrayBuffer();
 }
 
 // 이름표 + 입력 칸 + 도움말 + 오류 문구 한 묶음

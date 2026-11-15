@@ -1,6 +1,7 @@
 import os from 'node:os';
 import path from 'node:path';
 
+import { fileLimitsFromEnv } from './app.js';
 import { ConfigError, DATABASE_FILE, ROOT, createNodeApp, logoutAll, resetAdminPassword } from './node.js';
 
 const HELP = `과제 링크 제출함
@@ -16,6 +17,8 @@ const HELP = `과제 링크 제출함
   DATA_DIR         데이터를 저장할 폴더 (기본: 프로그램 폴더 안의 data)
   ADMIN_PASSWORD   관리자 비밀번호 (8자 이상). 정하지 않으면 처음 실행할 때 자동으로 만들어 알려 줍니다.
   TRUST_PROXY      서버 앞에 있는 프록시(리버스 프록시, 클라우드 로드밸런서)의 개수 (기본 0)
+  MAX_FILE_MB      학생이 첨부할 수 있는 파일 하나의 크기, MB (기본 10)
+  FILE_STORAGE_MB  받아 둘 수 있는 첨부 파일 전체의 크기, MB (기본 1024)
 `;
 
 function box(lines) {
@@ -70,7 +73,7 @@ export async function main(argv, env) {
     throw new ConfigError(`TRUST_PROXY 는 0 이상의 숫자여야 합니다: ${env.TRUST_PROXY}`);
   }
 
-  const app = await createNodeApp({ dataDir, adminPassword, trustProxy });
+  const app = await createNodeApp({ dataDir, adminPassword, trustProxy, limits: fileLimitsFromEnv(env) });
 
   await new Promise((resolve, reject) => {
     app.server.once('error', (error) => {

@@ -16,13 +16,14 @@ export function toCsv(rows) {
 }
 
 export function submissionTable({ submissions, missing }, formatTime) {
-  const rows = [['학번', '이름', '상태', '링크', '메모', '제출 시각', '처음 제출한 시각', '제출 횟수']];
+  const rows = [['학번', '이름', '상태', '링크', '파일', '메모', '제출 시각', '처음 제출한 시각', '제출 횟수']];
   for (const s of submissions) {
     rows.push([
       s.studentId,
       s.name,
       s.isLate ? '지각' : '제출',
       s.url,
+      s.file ? s.file.name : '',
       s.note,
       formatTime(s.updatedAt),
       formatTime(s.createdAt),
@@ -30,7 +31,7 @@ export function submissionTable({ submissions, missing }, formatTime) {
     ]);
   }
   for (const student of missing) {
-    rows.push([student.studentId, student.name, '미제출', '', '', '', '', 0]);
+    rows.push([student.studentId, student.name, '미제출', '', '', '', '', '', 0]);
   }
   return rows;
 }

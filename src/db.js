@@ -19,6 +19,8 @@
 //   transaction(work)      work(tx) 를 한 묶음으로 실행하고, 예외가 나면 되돌림. tx 도 get/all/run/exec 를 가짐
 //   close()                (선택) 닫기
 
+import { Buffer } from 'node:buffer';
+
 const get = (sql, ...params) => ({ method: 'get', sql, params });
 const all = (sql, ...params) => ({ method: 'all', sql, params });
 const run = (sql, ...params) => ({ method: 'run', sql, params });
@@ -86,7 +88,40 @@ const MIGRATIONS = [
   // 과제마다 학번을 꼭 받을지 정합니다. 이전에 만든 과제는 지금까지처럼 학번을 받습니다.
   // 학번 없이 낸 제출은 submissions.student_id 에 "~이름" 을 넣어 구분합니다(src/app.js 의 submissionKey).
   'ALTER TABLE assignments ADD COLUMN require_student_id INTEGER NOT NULL DEFAULT 1',
+
+  // 첨부 파일. 이전에 만든 과제도 파일을 받습니다(과제마다 끌 수 있음).
+  `
+  ALTER TABLE assignments ADD COLUMN allow_files INTEGER NOT NULL DEFAULT 1;
+  ALTER TABLE submission_history ADD COLUMN file_name TEXT NOT NULL DEFAULT '';
+
+  -- 학생이 올린 파일 하나. 다 올라온 뒤 제출에 붙으면 submission_id 가 채워집니다.
+  -- 올리는 중이거나 아직 제출하지 않은 파일은 submission_id 가 NULL 이고, 한동안 그대로면 지웁니다.
+  CREATE TABLE files (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    assignment_id INTEGER NOT NULL,
+    submission_id INTEGER,
+    name          TEXT NOT NULL,
+    size          INTEGER NOT NULL,
+    chunks        INTEGER NOT NULL,
+    token_hash    TEXT NOT NULL,
+    created_at    TEXT NOT NULL
+  );
+  CREATE INDEX files_by_submission ON files (submission_id);
+  CREATE INDEX files_by_assignment ON files (assignment_id);
+
+  -- 파일 내용. 요청 하나에 실을 수 있는 크기에 한도가 있는 실행 환경(Vercel)에서도 큰 파일을 받을 수 있게 조각으로 나눠 넣습니다.
+  CREATE TABLE file_chunks (
+    file_id INTEGER NOT NULL,
+    seq     INTEGER NOT NULL,
+    data    BLOB NOT NULL,
+    PRIMARY KEY (file_id, seq)
+  )
+  `,
 ];
+
+// 제출 한 줄을 첨부 파일 정보와 함께 읽습니다. 파일은 제출 하나에 하나까지입니다.
+const SUBMISSION_COLUMNS = 's.*, f.id AS file_id, f.name AS file_name, f.size AS file_size, f.chunks AS file_chunks';
+const SUBMISSION_FROM = 'submissions s LEFT JOIN files f ON f.submission_id = s.id';
 
 // 모든 시각은 UTC ISO 문자열(2026-11-15T05:03:00.000Z)로 저장해서 문자열 비교가 곧 시간 비교가 됩니다.
 export class Store {
@@ -179,9 +214,10 @@ export class Store {
     return (yield get('SELECT * FROM assignments WHERE slug = ?', slug)) ?? null;
   }
 
-  *#createAssignment({ slug, title, description, dueAt, allowLate, isOpen, requireStudentId, createdAt }) {
+  *#createAssignment({ slug, title, description, dueAt, allowLate, isOpen, requireStudentId, allowFiles, createdAt }) {
     yield run(
-      'INSERT INTO assignments (slug, title, description, due_at, allow_late, is_open, require_student_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      `INSERT INTO assignments (slug, title, description, due_at, allow_late, is_open, require_student_id, allow_files, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       slug,
       title,
       description,
@@ -189,31 +225,36 @@ export class Store {
       allowLate ? 1 : 0,
       isOpen ? 1 : 0,
       requireStudentId ? 1 : 0,
+      allowFiles ? 1 : 0,
       createdAt,
     );
     return yield* this.#getAssignmentBySlug(slug);
   }
 
-  *#updateAssignment(id, { title, description, dueAt, allowLate, isOpen, requireStudentId }) {
+  *#updateAssignment(id, { title, description, dueAt, allowLate, isOpen, requireStudentId, allowFiles }) {
     yield run(
-      'UPDATE assignments SET title = ?, description = ?, due_at = ?, allow_late = ?, is_open = ?, require_student_id = ? WHERE id = ?',
+      'UPDATE assignments SET title = ?, description = ?, due_at = ?, allow_late = ?, is_open = ?, require_student_id = ?, allow_files = ? WHERE id = ?',
       title,
       description,
       dueAt,
       allowLate ? 1 : 0,
       isOpen ? 1 : 0,
       requireStudentId ? 1 : 0,
+      allowFiles ? 1 : 0,
       id,
     );
     return yield* this.#getAssignment(id);
   }
 
+  // 과제와 딸린 기록을 지우고, 내용을 따로 지워야 하는 파일들의 번호를 돌려줍니다. 과제가 없으면 null.
   *#deleteAssignment(id) {
-    if (!(yield* this.#getAssignment(id))) return false;
+    if (!(yield* this.#getAssignment(id))) return null;
+    const files = yield all('SELECT id FROM files WHERE assignment_id = ?', id);
     yield run('DELETE FROM submission_history WHERE submission_id IN (SELECT id FROM submissions WHERE assignment_id = ?)', id);
     yield run('DELETE FROM submissions WHERE assignment_id = ?', id);
+    yield run('DELETE FROM files WHERE assignment_id = ?', id);
     yield run('DELETE FROM assignments WHERE id = ?', id);
-    return true;
+    return files.map((file) => file.id);
   }
 
   listAssignments() {
@@ -240,9 +281,14 @@ export class Store {
     return this.#run(this.#updateAssignment(id, fields));
   }
 
-  // 과제와 그 과제의 제출·이전 링크 기록을 함께 지웁니다.
-  deleteAssignment(id) {
-    return this.#atomic(() => this.#deleteAssignment(id));
+  // 과제와 그 과제의 제출·이전 링크 기록·첨부 파일을 함께 지웁니다. 지웠으면 true.
+  // 파일 내용은 양이 많을 수 있어서 한 묶음에 넣지 않고 파일 하나씩 지웁니다.
+  // 도중에 멈춰서 남은 조각은 sweepOrphanChunks 가 나중에 치웁니다.
+  async deleteAssignment(id) {
+    const fileIds = await this.#atomic(() => this.#deleteAssignment(id));
+    if (fileIds === null) return false;
+    for (const fileId of fileIds) await this.#run(this.#deleteChunks(fileId));
+    return true;
   }
 
   // 과제별 제출 수와 지각 수. 지각 여부는 저장하지 않고 마감 일시와 비교해서 구하므로, 마감을 늦추면 바로 반영됩니다.
@@ -263,17 +309,29 @@ export class Store {
   // ── 제출 ──
 
   *#getSubmission(assignmentId, studentId) {
-    return (yield get('SELECT * FROM submissions WHERE assignment_id = ? AND student_id = ?', assignmentId, studentId)) ?? null;
+    const row = yield get(`SELECT ${SUBMISSION_COLUMNS} FROM ${SUBMISSION_FROM} WHERE s.assignment_id = ? AND s.student_id = ?`, assignmentId, studentId);
+    return row ?? null;
   }
 
   *#getSubmissionById(id) {
-    return (yield get('SELECT * FROM submissions WHERE id = ?', id)) ?? null;
+    return (yield get(`SELECT ${SUBMISSION_COLUMNS} FROM ${SUBMISSION_FROM} WHERE s.id = ?`, id)) ?? null;
   }
 
-  *#saveSubmission({ assignmentId, studentId, name, url, note, passwordHash, expectedHash, at, maxSubmissions, maxLinkChanges }) {
+  // file: { action: 'keep' } 그대로 둠 | { action: 'remove' } 첨부를 뺌 | { action: 'attach', fileId } 다 올린 파일을 붙임(있던 파일은 지움)
+  *#saveSubmission({ assignmentId, studentId, name, url, note, passwordHash, expectedHash, at, maxSubmissions, maxLinkChanges, file = { action: 'keep' } }) {
     if (!(yield* this.#getAssignment(assignmentId))) return { status: 'gone' };
     const current = yield* this.#getSubmission(assignmentId, studentId);
     if ((current ? current.password_hash : null) !== expectedHash) return { status: 'conflict' };
+
+    // 붙일 파일은 이 과제에 올린 것이고, 조각이 모두 와 있고, 아직 어느 제출에도 붙지 않았어야 합니다.
+    if (file.action === 'attach') {
+      const upload = yield get('SELECT chunks FROM files WHERE id = ? AND assignment_id = ? AND submission_id IS NULL', file.fileId, assignmentId);
+      if (!upload || (yield* this.#countChunks(file.fileId)) !== upload.chunks) return { status: 'file_gone' };
+    }
+    const hadFile = Boolean(current && current.file_id);
+    const fileChanged = file.action === 'attach' || (file.action === 'remove' && hadFile);
+    // 링크와 파일 가운데 하나는 있어야 합니다.
+    if (!url && !(file.action === 'attach' || (file.action === 'keep' && hadFile))) return { status: 'empty' };
 
     if (!current) {
       const { count } = yield get('SELECT COUNT(*) AS count FROM submissions WHERE assignment_id = ?', assignmentId);
@@ -289,12 +347,16 @@ export class Store {
         at,
         at,
       );
+      if (file.action === 'attach') {
+        const created = yield* this.#getSubmission(assignmentId, studentId);
+        yield run('UPDATE files SET submission_id = ? WHERE id = ?', created.id, file.fileId);
+      }
       return { status: 'created', row: yield* this.#getSubmission(assignmentId, studentId) };
     }
 
-    // 제출 시각과 지각 여부는 링크를 기준으로 합니다. 링크가 그대로면 시각을 건드리지 않으므로,
-    // 마감 뒤에 같은 링크를 다시 내거나 이름·메모만 고쳐도 지각이 되지 않습니다.
-    if (current.url === url) {
+    // 제출 시각과 지각 여부는 링크와 파일을 기준으로 합니다. 둘 다 그대로면 시각을 건드리지 않으므로,
+    // 마감 뒤에 같은 내용을 다시 내거나 이름·메모만 고쳐도 지각이 되지 않습니다.
+    if (current.url === url && !fileChanged) {
       const edited = current.student_name !== name || current.note !== note;
       if (edited || current.password_hash !== passwordHash) {
         yield run('UPDATE submissions SET student_name = ?, note = ?, password_hash = ? WHERE id = ?', name, note, passwordHash, current.id);
@@ -302,15 +364,17 @@ export class Store {
       return { status: edited ? 'updated' : 'unchanged', row: yield* this.#getSubmission(assignmentId, studentId) };
     }
 
-    // revision 은 1에서 시작하므로 링크를 바꾼 횟수는 revision - 1 입니다.
+    // revision 은 1에서 시작하므로 링크나 파일을 바꾼 횟수는 revision - 1 입니다.
     if (current.revision - 1 >= maxLinkChanges) return { status: 'too_many_changes' };
 
+    // 이전 파일은 이름만 기록에 남기고 내용은 지웁니다.
     yield run(
-      'INSERT INTO submission_history (submission_id, student_name, url, note, submitted_at) VALUES (?, ?, ?, ?, ?)',
+      'INSERT INTO submission_history (submission_id, student_name, url, note, file_name, submitted_at) VALUES (?, ?, ?, ?, ?, ?)',
       current.id,
       current.student_name,
       current.url,
       current.note,
+      current.file_name ?? '',
       current.updated_at,
     );
     yield run(
@@ -322,11 +386,22 @@ export class Store {
       at,
       current.id,
     );
+    if (fileChanged) {
+      if (hadFile) {
+        yield run('DELETE FROM files WHERE id = ?', current.file_id);
+        yield* this.#deleteChunks(current.file_id);
+      }
+      if (file.action === 'attach') yield run('UPDATE files SET submission_id = ? WHERE id = ?', current.id, file.fileId);
+    }
     return { status: 'updated', row: yield* this.#getSubmission(assignmentId, studentId) };
   }
 
   *#deleteSubmission(id) {
     if (!(yield* this.#getSubmissionById(id))) return false;
+    for (const file of yield all('SELECT id FROM files WHERE submission_id = ?', id)) {
+      yield run('DELETE FROM files WHERE id = ?', file.id);
+      yield* this.#deleteChunks(file.id);
+    }
     yield run('DELETE FROM submission_history WHERE submission_id = ?', id);
     yield run('DELETE FROM submissions WHERE id = ?', id);
     return true;
@@ -354,8 +429,8 @@ export class Store {
       (function* list() {
         return yield all(
           `
-          SELECT s.*, r.name AS roster_name
-            FROM submissions s LEFT JOIN roster r ON r.student_id = s.student_id
+          SELECT ${SUBMISSION_COLUMNS}, r.name AS roster_name
+            FROM ${SUBMISSION_FROM} LEFT JOIN roster r ON r.student_id = s.student_id
            WHERE s.assignment_id = ?
            ORDER BY s.student_id
           `,
@@ -370,8 +445,8 @@ export class Store {
       (function* detail() {
         const row = yield get(
           `
-          SELECT s.*, r.name AS roster_name
-            FROM submissions s LEFT JOIN roster r ON r.student_id = s.student_id
+          SELECT ${SUBMISSION_COLUMNS}, r.name AS roster_name
+            FROM ${SUBMISSION_FROM} LEFT JOIN roster r ON r.student_id = s.student_id
            WHERE s.id = ?
           `,
           id,
@@ -399,6 +474,111 @@ export class Store {
     return this.#run(
       (function* clear() {
         yield run("UPDATE submissions SET password_hash = '' WHERE id = ?", id);
+      })(),
+    );
+  }
+
+  // ── 첨부 파일 ──
+
+  *#countChunks(fileId) {
+    return (yield get('SELECT COUNT(*) AS count FROM file_chunks WHERE file_id = ?', fileId)).count;
+  }
+
+  *#deleteChunks(fileId) {
+    yield run('DELETE FROM file_chunks WHERE file_id = ?', fileId);
+  }
+
+  // 아직 제출에 붙지 않은 파일을 지웁니다. 그사이 제출에 붙었다면 건드리지 않습니다.
+  *#discardUpload(id) {
+    const gone = yield get('DELETE FROM files WHERE id = ? AND submission_id IS NULL RETURNING id', id);
+    if (gone) yield* this.#deleteChunks(id);
+    return Boolean(gone);
+  }
+
+  // 올릴 자리를 만들고 번호를 돌려줍니다. 받은 파일의 합이 storageLimit(바이트)를 넘게 되면 만들지 않고 null.
+  // 확인과 만들기가 한 묶음이라 동시에 여러 명이 올려도 한도를 넘지 않습니다.
+  createUpload({ assignmentId, name, size, chunks, tokenHash, createdAt, storageLimit }) {
+    return this.#atomic(function* create() {
+      const { total } = yield get('SELECT COALESCE(SUM(size), 0) AS total FROM files');
+      if (total + size > storageLimit) return null;
+      const row = yield get(
+        'INSERT INTO files (assignment_id, name, size, chunks, token_hash, created_at) VALUES (?, ?, ?, ?, ?, ?) RETURNING id',
+        assignmentId,
+        name,
+        size,
+        chunks,
+        tokenHash,
+        createdAt,
+      );
+      return row.id;
+    });
+  }
+
+  getFile(id) {
+    return this.#run(
+      (function* find() {
+        return (yield get('SELECT * FROM files WHERE id = ?', id)) ?? null;
+      })(),
+    );
+  }
+
+  // 조각 하나를 넣습니다. 같은 조각을 다시 보내면(응답을 못 받고 다시 시도한 경우) 처음 것을 그대로 둡니다.
+  putChunk(fileId, seq, data) {
+    return this.#run(
+      (function* put() {
+        yield run('INSERT OR IGNORE INTO file_chunks (file_id, seq, data) VALUES (?, ?, ?)', fileId, seq, data);
+      })(),
+    );
+  }
+
+  countChunks(fileId) {
+    return this.#run(this.#countChunks(fileId));
+  }
+
+  // 조각 하나의 내용(Buffer). 없으면 null.
+  getChunk(fileId, seq) {
+    const read = (row) => (row ? Buffer.from(row.data) : null);
+    const found = this.#run(
+      (function* find() {
+        return yield get('SELECT data FROM file_chunks WHERE file_id = ? AND seq = ?', fileId, seq);
+      })(),
+    );
+    return typeof found?.then === 'function' ? found.then(read) : read(found);
+  }
+
+  discardUpload(id) {
+    return this.#atomic(() => this.#discardUpload(id));
+  }
+
+  // 올리다 만 파일과 올려 놓고 제출하지 않은 파일을 치웁니다. 한 번에 limit 개까지.
+  async discardExpiredUploads(before, limit = 20) {
+    const expired = await this.#run(
+      (function* find() {
+        return yield all('SELECT id FROM files WHERE submission_id IS NULL AND created_at < ? LIMIT ?', before, limit);
+      })(),
+    );
+    for (const file of expired) await this.discardUpload(file.id);
+  }
+
+  // 어느 파일에도 속하지 않는 조각(지우다가 멈춘 경우)을 치웁니다. 한 번에 limit 개까지.
+  sweepOrphanChunks(limit = 40) {
+    return this.#run(
+      (function* sweep() {
+        yield run(
+          `DELETE FROM file_chunks WHERE rowid IN (
+             SELECT c.rowid FROM file_chunks c LEFT JOIN files f ON f.id = c.file_id WHERE f.id IS NULL LIMIT ?
+           )`,
+          limit,
+        );
+      })(),
+    );
+  }
+
+  // 받아 둔 파일 전체의 크기(바이트). 올리는 중인 것도 셉니다.
+  fileBytes() {
+    return this.#run(
+      (function* total() {
+        return (yield get('SELECT COALESCE(SUM(size), 0) AS total FROM files')).total;
       })(),
     );
   }
