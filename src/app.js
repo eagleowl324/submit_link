@@ -1,0 +1,822 @@
+import http from 'node:http';
+import path from 'node:path';
+import { isIP } from 'node:net';
+import { createHash } from 'node:crypto';
+import { chmodSync, mkdirSync, readFileSync, readdirSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+
+import { Store } from './db.js';
+import {
+  RateLimiter,
+  generateAdminPassword,
+  hashPassword,
+  newToken,
+  randomSlug,
+  sameSecret,
+  sha256,
+  verifyPassword,
+} from './security.js';
+import {
+  LIMITS,
+  readSiteTitle,
+  readStudentId,
+  singleLine,
+  validateAssignment,
+  validateRoster,
+  validateSubmission,
+} from '../shared/rules.js';
+
+export const ROOT = fileURLToPath(new URL('..', import.meta.url));
+export const DATABASE_FILE = 'submissions.db';
+
+const DEFAULT_TITLE = '과제 링크 제출함';
+const SESSION_COOKIE = 'admin_session';
+const SESSION_SECONDS = 7 * 24 * 60 * 60;
+const BODY_LIMIT = 32 * 1024;
+const ROSTER_BODY_LIMIT = 1024 * 1024;
+
+// 한 IP에서 1분 동안 받는 제출·조회 요청 수.
+// 학교에서는 수백 명이 같은 IP로 접속하므로 넉넉하게 둡니다. 비밀번호 추측은 아래 한도가 따로 막습니다.
+const POSTS_PER_MINUTE = 600;
+// 학번 하나(또는 관리자 로그인)에 대해 10분 동안 허용하는 비밀번호 시도 횟수
+const PASSWORD_ATTEMPTS = 8;
+const LOGIN_ATTEMPTS = 10;
+const ATTEMPT_WINDOW_MS = 10 * 60 * 1000;
+
+// 누군가 제출을 끝없이 쌓아 저장 공간과 관리 화면을 망가뜨리는 것을 막는 한도
+const MAX_SUBMISSIONS_PER_ASSIGNMENT = 5000;
+const MAX_LINK_CHANGES = 30;
+
+const SECURITY_HEADERS = {
+  'X-Content-Type-Options': 'nosniff',
+  'X-Frame-Options': 'DENY',
+  'Referrer-Policy': 'no-referrer',
+  'X-Robots-Tag': 'noindex, nofollow',
+};
+const CONTENT_SECURITY_POLICY =
+  "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
+
+const CONTENT_TYPES = {
+  '.css': 'text/css; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.svg': 'image/svg+xml',
+};
+
+const ALREADY_SUBMITTED =
+  '이 학번으로 이미 제출된 링크가 있습니다. 처음 제출할 때 정한 비밀번호를 입력해야 고칠 수 있습니다. 비밀번호가 기억나지 않으면 선생님께 말씀드리세요.';
+
+export class ConfigError extends Error {}
+
+class HttpError extends Error {
+  constructor(status, code, message, extra = {}) {
+    super(message);
+    this.status = status;
+    this.code = code;
+    this.extra = extra;
+  }
+}
+
+function invalid(fields) {
+  return new HttpError(400, 'invalid', '입력한 내용을 다시 확인해 주세요.', { fields });
+}
+
+function tooMany(retryAfter, lead) {
+  const wait = retryAfter < 60 ? `${retryAfter}초` : `${Math.ceil(retryAfter / 60)}분`;
+  return new HttpError(429, 'too_many_attempts', `${lead} ${wait} 뒤에 다시 시도하세요.`, { retryAfter });
+}
+
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]);
+}
+
+function fillTemplate(html, values) {
+  return html.replace(/\{\{(\w+)\}\}/g, (whole, key) => (key in values ? escapeHtml(values[key]) : whole));
+}
+
+function readCookie(req, name) {
+  const header = req.headers.cookie;
+  if (!header) return null;
+  for (const part of header.split(';')) {
+    const index = part.indexOf('=');
+    if (index !== -1 && part.slice(0, index).trim() === name) return part.slice(index + 1).trim();
+  }
+  return null;
+}
+
+async function readJson(req, limit) {
+  if (contentType(req) !== 'application/json') throw new HttpError(415, 'unsupported_media_type', '요청 형식이 올바르지 않습니다.');
+  if (Number(req.headers['content-length']) > limit) throw new HttpError(413, 'too_large', '보낸 내용이 너무 큽니다.');
+
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > limit) throw new HttpError(413, 'too_large', '보낸 내용이 너무 큽니다.');
+    chunks.push(chunk);
+  }
+  let body;
+  try {
+    body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+  } catch {
+    throw new HttpError(400, 'bad_json', '요청 내용을 읽을 수 없습니다.');
+  }
+  if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+    throw new HttpError(400, 'bad_json', '요청 내용을 읽을 수 없습니다.');
+  }
+  return body;
+}
+
+function loadAssets() {
+  const assets = new Map();
+  const addFolder = (prefix, folder) => {
+    for (const name of readdirSync(folder)) {
+      const type = CONTENT_TYPES[path.extname(name)];
+      if (!type) continue;
+      const body = readFileSync(path.join(folder, name));
+      const etag = `"${createHash('sha256').update(body).digest('base64url').slice(0, 22)}"`;
+      assets.set(prefix + name, { body, type, etag });
+    }
+  };
+  addFolder('', path.join(ROOT, 'public'));
+  addFolder('shared/', path.join(ROOT, 'shared'));
+  return assets;
+}
+
+// 요청 제한에 쓰는 접속자 구분값.
+// 프록시가 넣어 주는 값에는 포트가 붙어 있기도 해서(203.0.113.7:4000, [2001:db8::1]:4000) 떼어 내고,
+// IP 주소가 아닌 값은 모두 한 묶음('unknown')으로 셉니다.
+// IPv6는 한 사람이 주소를 얼마든지 바꿀 수 있어서 앞쪽 /64 단위로 묶습니다.
+export function rateKey(address) {
+  let ip = String(address ?? '').trim().toLowerCase();
+  const bracketed = /^\[([^\]]+)\](?::\d+)?$/.exec(ip);
+  if (bracketed) ip = bracketed[1];
+  else if (/^\d{1,3}(?:\.\d{1,3}){3}:\d+$/.test(ip)) ip = ip.slice(0, ip.lastIndexOf(':'));
+  ip = ip.split('%')[0];
+  const mapped = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/.exec(ip);
+  if (mapped) ip = mapped[1];
+
+  const family = isIP(ip);
+  if (family === 4) return ip;
+  if (family !== 6) return 'unknown';
+  const [head, tail] = ip.split('::');
+  const left = head ? head.split(':') : [];
+  const right = tail ? tail.split(':') : [];
+  const groups = ip.includes('::') ? [...left, ...Array(Math.max(0, 8 - left.length - right.length)).fill('0'), ...right] : left;
+  return `${groups.slice(0, 4).map((group) => group.replace(/^0+(?=.)/, '')).join(':')}::/64`;
+}
+
+// X-Forwarded-For 는 보내는 쪽이 마음대로 쓸 수 있는 값입니다. 그래서 바로 앞에서 접속한 상대가
+// 같은 컴퓨터나 사설망(프록시가 있을 만한 곳)일 때만 그 값을 믿습니다.
+export function isProxyPeer(address) {
+  const ip = rateKey(address);
+  if (ip === 'unknown') return false;
+  if (ip.includes(':')) return ip === '0:0:0:0::/64' || /^f[cd][0-9a-f]{2}:/.test(ip) || /^fe[89ab][0-9a-f]:/.test(ip);
+  const [a, b] = ip.split('.').map(Number);
+  return (
+    a === 127 || a === 10 || (a === 192 && b === 168) || (a === 172 && b >= 16 && b <= 31) || (a === 169 && b === 254) || (a === 100 && b >= 64 && b <= 127)
+  );
+}
+
+function contentType(req) {
+  return String(req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
+}
+
+function assignmentState(assignment, at) {
+  if (!assignment.is_open) return 'closed';
+  if (assignment.due_at && at.toISOString() > assignment.due_at) return assignment.allow_late ? 'late' : 'closed';
+  return 'open';
+}
+
+function isLate(assignment, submittedAt) {
+  return Boolean(assignment.due_at) && submittedAt > assignment.due_at;
+}
+
+function publicAssignment(assignment, at) {
+  return {
+    slug: assignment.slug,
+    title: assignment.title,
+    description: assignment.description,
+    dueAt: assignment.due_at,
+    allowLate: Boolean(assignment.allow_late),
+    state: assignmentState(assignment, at),
+  };
+}
+
+function adminAssignment(assignment, at) {
+  return { id: assignment.id, isOpen: Boolean(assignment.is_open), createdAt: assignment.created_at, ...publicAssignment(assignment, at) };
+}
+
+function adminSubmission(row, assignment) {
+  return { id: row.id, ...publicSubmission(row, assignment), hasPassword: row.password_hash !== '', rosterName: row.roster_name ?? null };
+}
+
+function publicSubmission(row, assignment) {
+  return {
+    studentId: row.student_id,
+    name: row.student_name,
+    url: row.url,
+    note: row.note,
+    revision: row.revision,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    isLate: isLate(assignment, row.updated_at),
+  };
+}
+
+// 학생 화면의 과제 순서: 받는 중(마감 임박 순) → 지각 접수 중 → 마감
+function compareForStudents(a, b) {
+  const rank = { open: 0, late: 1, closed: 2 };
+  if (rank[a.state] !== rank[b.state]) return rank[a.state] - rank[b.state];
+  if (a.state === 'open' && a.dueAt !== b.dueAt) {
+    if (!a.dueAt) return 1;
+    if (!b.dueAt) return -1;
+    return a.dueAt < b.dueAt ? -1 : 1;
+  }
+  return 0;
+}
+
+export async function resetAdminPassword(dataDir) {
+  mkdirSync(dataDir, { recursive: true });
+  const store = new Store(path.join(dataDir, DATABASE_FILE));
+  try {
+    const password = generateAdminPassword();
+    store.setSetting('admin_password_hash', await hashPassword(password));
+    store.deleteAllSessions();
+    return password;
+  } finally {
+    store.close();
+  }
+}
+
+// 모든 기기의 관리자 로그인을 끊습니다. (로그인한 기기를 잃어버렸을 때)
+export function logoutAll(dataDir) {
+  mkdirSync(dataDir, { recursive: true });
+  const store = new Store(path.join(dataDir, DATABASE_FILE));
+  try {
+    store.deleteAllSessions();
+  } finally {
+    store.close();
+  }
+}
+
+export async function createApp(options = {}) {
+  const { dataDir = path.join(ROOT, 'data'), adminPassword = '', trustProxy = 0, now = () => new Date(), limits = {} } = options;
+  const maxSubmissions = limits.maxSubmissions ?? MAX_SUBMISSIONS_PER_ASSIGNMENT;
+  const maxLinkChanges = limits.maxLinkChanges ?? MAX_LINK_CHANGES;
+
+  if (adminPassword && adminPassword.length < LIMITS.adminPasswordMin) {
+    throw new ConfigError(`ADMIN_PASSWORD 는 ${LIMITS.adminPasswordMin}자 이상이어야 합니다.`);
+  }
+
+  let store;
+  try {
+    // 같은 컴퓨터의 다른 계정이 학생 정보를 읽지 못하게 폴더와 파일을 본인만 볼 수 있게 만듭니다.
+    mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+    store = new Store(path.join(dataDir, DATABASE_FILE));
+    try {
+      chmodSync(path.join(dataDir, DATABASE_FILE), 0o600);
+    } catch {
+      // 권한을 바꿀 수 없는 파일 시스템에서는 그대로 둡니다.
+    }
+  } catch (error) {
+    throw new ConfigError(`데이터 폴더를 쓸 수 없습니다: ${dataDir}\n(${error.message})\nDATA_DIR 로 쓸 수 있는 폴더를 지정해 주세요.`);
+  }
+  const limiter = new RateLimiter(() => now().getTime());
+  const assets = loadAssets();
+  const studentPage = readFileSync(path.join(ROOT, 'public', 'index.html'), 'utf8');
+  const adminPage = readFileSync(path.join(ROOT, 'public', 'admin.html'), 'utf8');
+
+  // 비밀번호를 정해 주지 않았다면 처음 한 번 무작위로 만들어 알려 줍니다.
+  let generatedAdminPassword = null;
+  if (!adminPassword && !store.getSetting('admin_password_hash')) {
+    generatedAdminPassword = generateAdminPassword();
+    store.setSetting('admin_password_hash', await hashPassword(generatedAdminPassword));
+  }
+
+  // 관리자 비밀번호를 정하는 방식이나 값이 바뀌었으면(ADMIN_PASSWORD 를 바꾸거나 없앴으면) 예전 로그인을 모두 끊습니다.
+  // 비밀번호를 바꿨는데 예전에 로그인해 둔 기기가 계속 들어올 수 있으면 안 되기 때문입니다.
+  const authMarker = store.getSetting('admin_auth_marker');
+  const sameAuth = adminPassword ? Boolean(authMarker) && (await verifyPassword(adminPassword, authMarker)) : authMarker === 'stored';
+  if (!sameAuth) {
+    store.deleteAllSessions();
+    store.setSetting('admin_auth_marker', adminPassword ? await hashPassword(adminPassword) : 'stored');
+  }
+
+  const siteTitle = () => store.getSetting('site_title') || DEFAULT_TITLE;
+  const rosterOnly = () => store.getSetting('roster_only') === '1';
+
+  // ── 응답 ────────────────────────────────────────────────────────────────
+
+  function send(res, status, body, headers = {}) {
+    const buffer = Buffer.isBuffer(body) ? body : Buffer.from(body ?? '', 'utf8');
+    res.writeHead(status, { ...SECURITY_HEADERS, 'Content-Length': buffer.length, ...headers });
+    res.end(res.req.method === 'HEAD' ? undefined : buffer);
+  }
+
+  function sendJson(res, status, data, headers = {}) {
+    send(res, status, JSON.stringify(data), { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...headers });
+  }
+
+  function sendHtml(res, status, html) {
+    send(res, status, html, {
+      'Content-Type': 'text/html; charset=utf-8',
+      'Cache-Control': 'no-cache',
+      'Content-Security-Policy': CONTENT_SECURITY_POLICY,
+    });
+  }
+
+  function sendText(res, status, text, headers = {}) {
+    send(res, status, text, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store', ...headers });
+  }
+
+  // ── 요청 정보 ────────────────────────────────────────────────────────────
+
+  // 프록시 뒤에서는 TRUST_PROXY 만큼 떨어진 X-Forwarded-For 항목이 실제 접속자입니다.
+  function clientIp(req) {
+    const peer = req.socket.remoteAddress || '';
+    if (trustProxy > 0 && isProxyPeer(peer)) {
+      const forwarded = String(req.headers['x-forwarded-for'] || '')
+        .split(',')
+        .map((item) => item.trim())
+        .filter(Boolean);
+      if (forwarded.length) return rateKey(forwarded[Math.max(0, forwarded.length - trustProxy)]);
+    }
+    return rateKey(peer);
+  }
+
+  function isHttps(req) {
+    if (req.socket.encrypted) return true;
+    return String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase() === 'https';
+  }
+
+  function sessionCookie(req, token, maxAge) {
+    return `${SESSION_COOKIE}=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${maxAge}${isHttps(req) ? '; Secure' : ''}`;
+  }
+
+  function currentSession(req) {
+    const token = readCookie(req, SESSION_COOKIE);
+    if (!token) return null;
+    const tokenHash = sha256(token);
+    return store.findSession(tokenHash, now().toISOString()) ? { tokenHash } : null;
+  }
+
+  function admin(handler) {
+    return (context) => {
+      const session = currentSession(context.req);
+      if (!session) throw new HttpError(401, 'unauthorized', '로그인이 필요합니다.');
+      return handler({ ...context, session });
+    };
+  }
+
+  function throttlePosts(req) {
+    const gate = limiter.take(`post:${clientIp(req)}`, POSTS_PER_MINUTE, 60 * 1000);
+    if (!gate.allowed) throw tooMany(gate.retryAfter, '요청이 너무 많습니다.');
+  }
+
+  // 시도 횟수를 먼저 세고 나서 확인합니다. 동시에 여러 번 찔러 보는 것을 막기 위해서입니다.
+  async function requireStudentPassword(assignmentId, studentId, password, storedHash, wrongMessage) {
+    const key = `password:${assignmentId}:${studentId}`;
+    const gate = limiter.take(key, PASSWORD_ATTEMPTS, ATTEMPT_WINDOW_MS);
+    if (!gate.allowed) throw tooMany(gate.retryAfter, '비밀번호를 여러 번 틀려서 이 학번의 제출이 잠시 막혔습니다.');
+    if (!(await verifyPassword(password, storedHash))) {
+      throw new HttpError(403, 'wrong_password', wrongMessage, { fields: { password: wrongMessage } });
+    }
+    limiter.reset(key);
+  }
+
+  async function isAdminPassword(password) {
+    if (!password || password.length > LIMITS.adminPasswordMax) return false;
+    if (adminPassword) return sameSecret(password, adminPassword);
+    const stored = store.getSetting('admin_password_hash');
+    return stored ? verifyPassword(password, stored) : false;
+  }
+
+  async function requireAdminPassword(req, password, error) {
+    const key = `login:${clientIp(req)}`;
+    const gate = limiter.take(key, LOGIN_ATTEMPTS, ATTEMPT_WINDOW_MS);
+    if (!gate.allowed) throw tooMany(gate.retryAfter, '비밀번호를 여러 번 틀렸습니다.');
+    if (!(await isAdminPassword(password))) throw error;
+    limiter.reset(key);
+  }
+
+  function findAssignmentBySlug(slug) {
+    const assignment = store.getAssignmentBySlug(slug);
+    if (!assignment) throw new HttpError(404, 'not_found', '과제를 찾을 수 없습니다.');
+    return assignment;
+  }
+
+  function findAssignment(id) {
+    const assignment = store.getAssignment(Number(id));
+    if (!assignment) throw new HttpError(404, 'not_found', '과제를 찾을 수 없습니다. 이미 삭제되었을 수 있습니다.');
+    return assignment;
+  }
+
+  // ── 화면과 정적 파일 ─────────────────────────────────────────────────────
+
+  function pageStudent({ res, params }) {
+    const title = siteTitle();
+    if (!params[0]) {
+      sendHtml(res, 200, fillTemplate(studentPage, { title, description: '과제 링크를 제출하는 곳입니다.' }));
+      return;
+    }
+    const assignment = store.getAssignmentBySlug(params[0]);
+    if (!assignment) {
+      sendHtml(res, 404, fillTemplate(studentPage, { title, description: '과제를 찾을 수 없습니다.' }));
+      return;
+    }
+    const summary = singleLine(assignment.description).slice(0, 120) || '과제 링크를 제출하는 곳입니다.';
+    sendHtml(res, 200, fillTemplate(studentPage, { title: `${assignment.title} · ${title}`, description: summary }));
+  }
+
+  function pageAdmin({ res }) {
+    sendHtml(res, 200, fillTemplate(adminPage, { title: `관리 · ${siteTitle()}` }));
+  }
+
+  function serveAsset({ req, res, params }) {
+    const asset = assets.get(params[0]);
+    if (!asset) throw new HttpError(404, 'not_found', '찾을 수 없는 주소입니다.');
+    const headers = { 'Content-Type': asset.type, 'Cache-Control': 'no-cache', ETag: asset.etag };
+    if (req.headers['if-none-match'] === asset.etag) {
+      res.writeHead(304, { ...SECURITY_HEADERS, ...headers });
+      res.end();
+      return;
+    }
+    send(res, 200, asset.body, headers);
+  }
+
+  // ── 학생용 API ───────────────────────────────────────────────────────────
+
+  function apiSite({ res }) {
+    const at = now();
+    const assignments = store
+      .listAssignments()
+      .map((assignment) => publicAssignment(assignment, at))
+      .sort(compareForStudents);
+    sendJson(res, 200, { title: siteTitle(), assignments });
+  }
+
+  async function apiSubmit({ req, res, params }) {
+    throttlePosts(req);
+    findAssignmentBySlug(params[0]);
+    const { value, errors } = validateSubmission(await readJson(req, BODY_LIMIT));
+    if (errors) throw invalid(errors);
+
+    // 본문을 받는 동안 선생님이 과제를 닫거나 지웠을 수 있으므로, 과제는 본문을 다 받은 뒤에 읽습니다.
+    // 마감과 지각도 이 시각으로 판단합니다.
+    const assignment = findAssignmentBySlug(params[0]);
+    const at = now();
+    if (assignmentState(assignment, at) === 'closed') {
+      throw new HttpError(403, 'closed', '이 과제는 제출이 마감되었습니다.');
+    }
+
+    const existing = store.getSubmission(assignment.id, value.studentId);
+    // "명단에 있는 학번만 받기"를 켜 두면 학번 오타나 장난 제출을 처음부터 막습니다.
+    if (!existing && rosterOnly() && store.rosterCount() > 0 && !store.isInRoster(value.studentId)) {
+      throw invalid({ studentId: '명단에 없는 학번입니다. 학번을 다시 확인하고, 맞게 썼다면 선생님께 말씀드리세요.' });
+    }
+    let passwordHash;
+    if (existing && existing.password_hash) {
+      await requireStudentPassword(assignment.id, value.studentId, value.password, existing.password_hash, ALREADY_SUBMITTED);
+      passwordHash = existing.password_hash;
+    } else {
+      passwordHash = await hashPassword(value.password);
+    }
+
+    const saved = store.saveSubmission({
+      assignmentId: assignment.id,
+      studentId: value.studentId,
+      name: value.name,
+      url: value.url,
+      note: value.note,
+      passwordHash,
+      expectedHash: existing ? existing.password_hash : null,
+      at: at.toISOString(),
+      maxSubmissions,
+      maxLinkChanges,
+    });
+    if (saved.status === 'gone') throw new HttpError(404, 'not_found', '과제를 찾을 수 없습니다.');
+    if (saved.status === 'conflict') {
+      throw new HttpError(409, 'conflict', '같은 학번으로 방금 다른 제출이 들어왔습니다. 다시 한 번 제출해 주세요.');
+    }
+    if (saved.status === 'full') {
+      throw new HttpError(403, 'full', '이 과제는 받을 수 있는 제출 수를 넘었습니다. 선생님께 알려 주세요.');
+    }
+    if (saved.status === 'too_many_changes') {
+      throw invalid({ url: `링크는 ${maxLinkChanges}번까지 바꿀 수 있습니다. 더 바꿔야 하면 선생님께 말씀드리세요.` });
+    }
+    sendJson(res, saved.status === 'created' ? 201 : 200, {
+      status: saved.status,
+      submission: publicSubmission(saved.row, assignment),
+    });
+  }
+
+  async function apiLookup({ req, res, params }) {
+    throttlePosts(req);
+    const assignment = findAssignmentBySlug(params[0]);
+    const body = await readJson(req, BODY_LIMIT);
+
+    const fields = {};
+    const { value: studentId, error: studentIdError } = readStudentId(body.studentId);
+    if (studentIdError) fields.studentId = studentIdError;
+    const password = typeof body.password === 'string' ? body.password : '';
+    if (!password) fields.password = '비밀번호를 입력하세요.';
+    else if (password.length > LIMITS.passwordMax) fields.password = '비밀번호가 맞지 않습니다.';
+    if (Object.keys(fields).length) throw invalid(fields);
+
+    const existing = store.getSubmission(assignment.id, studentId);
+    if (!existing) throw new HttpError(404, 'no_submission', '이 학번으로 제출된 링크가 없습니다.');
+    if (!existing.password_hash) {
+      throw new HttpError(403, 'password_reset', '선생님이 비밀번호를 초기화했습니다. 링크를 다시 제출하면서 새 비밀번호를 정하세요.');
+    }
+    await requireStudentPassword(assignment.id, studentId, password, existing.password_hash, '비밀번호가 맞지 않습니다.');
+    sendJson(res, 200, { submission: publicSubmission(existing, assignment) });
+  }
+
+  // ── 관리자 API ───────────────────────────────────────────────────────────
+
+  async function apiLogin({ req, res }) {
+    const body = await readJson(req, BODY_LIMIT);
+    const password = typeof body.password === 'string' ? body.password : '';
+    await requireAdminPassword(req, password, new HttpError(401, 'wrong_password', '비밀번호가 맞지 않습니다.'));
+
+    const at = now();
+    store.pruneSessions(at.toISOString());
+    const token = newToken();
+    store.createSession(sha256(token), at.toISOString(), new Date(at.getTime() + SESSION_SECONDS * 1000).toISOString());
+    sendJson(res, 200, { ok: true }, { 'Set-Cookie': sessionCookie(req, token, SESSION_SECONDS) });
+  }
+
+  function apiLogout({ req, res }) {
+    const token = readCookie(req, SESSION_COOKIE);
+    if (token) store.deleteSession(sha256(token));
+    sendJson(res, 200, { ok: true }, { 'Set-Cookie': sessionCookie(req, '', 0) });
+  }
+
+  function apiLogoutOthers({ res, session }) {
+    store.deleteOtherSessions(session.tokenHash);
+    sendJson(res, 200, { ok: true });
+  }
+
+  function apiSession({ req, res }) {
+    sendJson(res, 200, { authenticated: Boolean(currentSession(req)) });
+  }
+
+  function apiOverview({ res }) {
+    const at = now();
+    const stats = new Map(store.submissionStats().map((row) => [row.assignment_id, row]));
+    sendJson(res, 200, {
+      title: siteTitle(),
+      rosterCount: store.rosterCount(),
+      passwordFromEnv: Boolean(adminPassword),
+      assignments: store.listAssignments().map((assignment) => ({
+        ...adminAssignment(assignment, at),
+        submissionCount: stats.get(assignment.id)?.total ?? 0,
+        lateCount: stats.get(assignment.id)?.late ?? 0,
+      })),
+    });
+  }
+
+  async function apiCreateAssignment({ req, res }) {
+    const { value, errors } = validateAssignment(await readJson(req, BODY_LIMIT));
+    if (errors) throw invalid(errors);
+    let slug = randomSlug();
+    while (store.getAssignmentBySlug(slug)) slug = randomSlug();
+    const at = now();
+    const assignment = store.createAssignment({ slug, ...value, createdAt: at.toISOString() });
+    sendJson(res, 201, { assignment: adminAssignment(assignment, at) });
+  }
+
+  async function apiUpdateAssignment({ req, res, params }) {
+    const existing = findAssignment(params[0]);
+    const { value, errors } = validateAssignment(await readJson(req, BODY_LIMIT));
+    if (errors) throw invalid(errors);
+    sendJson(res, 200, { assignment: adminAssignment(store.updateAssignment(existing.id, value), now()) });
+  }
+
+  function apiDeleteAssignment({ res, params }) {
+    store.deleteAssignment(findAssignment(params[0]).id);
+    sendJson(res, 200, { ok: true });
+  }
+
+  function apiListSubmissions({ res, params }) {
+    const assignment = findAssignment(params[0]);
+    const rosterCount = store.rosterCount();
+    sendJson(res, 200, {
+      assignment: adminAssignment(assignment, now()),
+      rosterCount,
+      submissions: store.listSubmissions(assignment.id).map((row) => adminSubmission(row, assignment)),
+      missing: rosterCount
+        ? store.missingStudents(assignment.id).map((row) => ({ studentId: row.student_id, name: row.name }))
+        : [],
+    });
+  }
+
+  // 제출 한 건과 이전 링크 기록. 기록은 목록에 싣지 않고 "자세히"를 열 때만 받아 갑니다.
+  function apiGetSubmission({ res, params }) {
+    const row = store.getSubmissionDetail(Number(params[0]));
+    const assignment = row ? store.getAssignment(row.assignment_id) : null;
+    if (!row || !assignment) throw new HttpError(404, 'not_found', '제출 내역을 찾을 수 없습니다. 이미 삭제되었을 수 있습니다.');
+    sendJson(res, 200, {
+      submission: {
+        ...adminSubmission(row, assignment),
+        history: store.listHistory(row.id).map((entry) => ({
+          name: entry.student_name,
+          url: entry.url,
+          note: entry.note,
+          submittedAt: entry.submitted_at,
+          isLate: isLate(assignment, entry.submitted_at),
+        })),
+      },
+    });
+  }
+
+  function apiDeleteSubmission({ res, params }) {
+    const submission = store.getSubmissionById(Number(params[0]));
+    if (!submission || !store.deleteSubmission(submission.id)) {
+      throw new HttpError(404, 'not_found', '제출 내역을 찾을 수 없습니다. 이미 삭제되었을 수 있습니다.');
+    }
+    // 지운 제출에 걸려 있던 비밀번호 잠금도 풀어서, 같은 학번으로 바로 다시 낼 수 있게 합니다.
+    limiter.reset(`password:${submission.assignment_id}:${submission.student_id}`);
+    sendJson(res, 200, { ok: true });
+  }
+
+  function apiResetSubmissionPassword({ res, params }) {
+    const submission = store.getSubmissionById(Number(params[0]));
+    if (!submission) throw new HttpError(404, 'not_found', '제출 내역을 찾을 수 없습니다. 이미 삭제되었을 수 있습니다.');
+    store.clearSubmissionPassword(submission.id);
+    limiter.reset(`password:${submission.assignment_id}:${submission.student_id}`);
+    sendJson(res, 200, { ok: true });
+  }
+
+  function apiGetRoster({ res }) {
+    sendJson(res, 200, {
+      rosterOnly: rosterOnly(),
+      students: store.listRoster().map((row) => ({ studentId: row.student_id, name: row.name })),
+    });
+  }
+
+  async function apiPutRoster({ req, res }) {
+    const body = await readJson(req, ROSTER_BODY_LIMIT);
+    const { students, error } = validateRoster(body.students);
+    if (error) throw new HttpError(400, 'invalid', error);
+    store.replaceRoster(students);
+    if (typeof body.rosterOnly === 'boolean') store.setSetting('roster_only', body.rosterOnly ? '1' : '0');
+    sendJson(res, 200, { count: students.length, rosterOnly: rosterOnly() });
+  }
+
+  async function apiPutSettings({ req, res }) {
+    const body = await readJson(req, BODY_LIMIT);
+    const { value: title, error } = readSiteTitle(body.title);
+    if (error) throw invalid({ title: error });
+    store.setSetting('site_title', title);
+    sendJson(res, 200, { title });
+  }
+
+  async function apiChangePassword({ req, res, session }) {
+    if (adminPassword) {
+      throw new HttpError(409, 'managed_by_env', '관리자 비밀번호가 ADMIN_PASSWORD 환경 변수로 정해져 있어서 여기서는 바꿀 수 없습니다.');
+    }
+    const body = await readJson(req, BODY_LIMIT);
+    const currentPassword = typeof body.currentPassword === 'string' ? body.currentPassword : '';
+    const newPassword = typeof body.newPassword === 'string' ? body.newPassword : '';
+    if (newPassword.length < LIMITS.adminPasswordMin) {
+      throw invalid({ newPassword: `새 비밀번호는 ${LIMITS.adminPasswordMin}자 이상으로 정하세요.` });
+    }
+    if (newPassword.length > LIMITS.adminPasswordMax) {
+      throw invalid({ newPassword: `새 비밀번호는 ${LIMITS.adminPasswordMax}자까지 쓸 수 있습니다.` });
+    }
+    const wrong = '현재 비밀번호가 맞지 않습니다.';
+    await requireAdminPassword(req, currentPassword, new HttpError(403, 'wrong_password', wrong, { fields: { currentPassword: wrong } }));
+
+    store.setSetting('admin_password_hash', await hashPassword(newPassword));
+    store.deleteOtherSessions(session.tokenHash);
+    sendJson(res, 200, { ok: true });
+  }
+
+  // ── 라우팅 ───────────────────────────────────────────────────────────────
+
+  const SLUG = '([a-z0-9]{1,32})';
+  const ID = '(\\d{1,12})';
+  const routes = [
+    ['GET', /^\/$/, pageStudent],
+    ['GET', new RegExp(`^/a/${SLUG}/?$`), pageStudent],
+    ['GET', /^\/admin\/?$/, pageAdmin],
+    ['GET', /^\/assets\/([\w./-]+)$/, serveAsset],
+    ['GET', /^\/favicon\.ico$/, (context) => serveAsset({ ...context, params: ['favicon.svg'] })],
+    ['GET', /^\/robots\.txt$/, ({ res }) => sendText(res, 200, 'User-agent: *\nDisallow: /\n')],
+    ['GET', /^\/healthz$/, ({ res }) => sendText(res, 200, 'ok\n')],
+
+    ['GET', /^\/api\/site$/, apiSite],
+    ['POST', new RegExp(`^/api/assignments/${SLUG}/submissions$`), apiSubmit],
+    ['POST', new RegExp(`^/api/assignments/${SLUG}/lookup$`), apiLookup],
+
+    ['GET', /^\/api\/admin\/session$/, apiSession],
+    ['POST', /^\/api\/admin\/login$/, apiLogin],
+    ['POST', /^\/api\/admin\/logout$/, apiLogout],
+    ['POST', /^\/api\/admin\/logout-others$/, admin(apiLogoutOthers)],
+    ['GET', /^\/api\/admin\/overview$/, admin(apiOverview)],
+    ['POST', /^\/api\/admin\/assignments$/, admin(apiCreateAssignment)],
+    ['PUT', new RegExp(`^/api/admin/assignments/${ID}$`), admin(apiUpdateAssignment)],
+    ['DELETE', new RegExp(`^/api/admin/assignments/${ID}$`), admin(apiDeleteAssignment)],
+    ['GET', new RegExp(`^/api/admin/assignments/${ID}/submissions$`), admin(apiListSubmissions)],
+    ['GET', new RegExp(`^/api/admin/submissions/${ID}$`), admin(apiGetSubmission)],
+    ['DELETE', new RegExp(`^/api/admin/submissions/${ID}$`), admin(apiDeleteSubmission)],
+    ['POST', new RegExp(`^/api/admin/submissions/${ID}/reset-password$`), admin(apiResetSubmissionPassword)],
+    ['GET', /^\/api\/admin\/roster$/, admin(apiGetRoster)],
+    ['PUT', /^\/api\/admin\/roster$/, admin(apiPutRoster)],
+    ['PUT', /^\/api\/admin\/settings$/, admin(apiPutSettings)],
+    ['POST', /^\/api\/admin\/password$/, admin(apiChangePassword)],
+  ];
+
+  async function route(req, res) {
+    let url;
+    try {
+      url = new URL(req.url, 'http://localhost');
+    } catch {
+      throw new HttpError(400, 'bad_request', '잘못된 요청입니다.');
+    }
+    const method = req.method === 'HEAD' ? 'GET' : req.method;
+
+    let knownPath = false;
+    for (const [routeMethod, pattern, handler] of routes) {
+      const match = pattern.exec(url.pathname);
+      if (!match) continue;
+      knownPath = true;
+      if (routeMethod !== method) continue;
+      if (method !== 'GET') {
+        // 다른 주소의 페이지가 로그인한 선생님의 브라우저를 빌려 요청을 보내는 것(CSRF)을 두 겹으로 막습니다.
+        // 1) 브라우저가 알려 주는 출처가 이 사이트 자신이 아니면 받지 않습니다. 같은 도메인의 다른 주소(same-site)도 남입니다.
+        // 2) 내용을 바꾸는 요청은 본문이 없어도 JSON 형식이어야 합니다. 다른 주소의 페이지가 이런 요청을 보내려면
+        //    브라우저의 사전 확인(CORS)을 통과해야 하는데, 이 서버는 그 확인에 응하지 않습니다.
+        const fetchSite = req.headers['sec-fetch-site'];
+        if (fetchSite && fetchSite !== 'same-origin') {
+          throw new HttpError(403, 'cross_site', '다른 사이트에서 보낸 요청은 받지 않습니다.');
+        }
+        if (contentType(req) !== 'application/json') {
+          throw new HttpError(415, 'unsupported_media_type', '요청 형식이 올바르지 않습니다.');
+        }
+      }
+      await handler({ req, res, url, params: match.slice(1) });
+      return;
+    }
+    if (knownPath) throw new HttpError(405, 'method_not_allowed', '허용되지 않는 요청 방식입니다.');
+    throw new HttpError(404, 'not_found', '찾을 수 없는 주소입니다.');
+  }
+
+  function sendFailure(req, res, status, code, message, extra = {}) {
+    const headers = {};
+    if (extra.retryAfter) headers['Retry-After'] = String(extra.retryAfter);
+    // 본문을 다 읽지 않고 거절한 요청은 연결을 닫아 남은 본문을 받지 않습니다.
+    if (status === 413 || status === 415) headers.Connection = 'close';
+    if (String(req.url).startsWith('/api/')) sendJson(res, status, { error: { code, message, ...extra } }, headers);
+    else sendText(res, status, `${message}\n`, headers);
+  }
+
+  async function handle(req, res) {
+    try {
+      await route(req, res);
+    } catch (error) {
+      if (res.headersSent || res.destroyed) {
+        res.destroy();
+        return;
+      }
+      if (error instanceof HttpError) {
+        sendFailure(req, res, error.status, error.code, error.message, error.extra);
+        return;
+      }
+      // 보내던 쪽이 도중에 연결을 끊은 경우는 문제가 아닙니다.
+      if (req.destroyed || error?.code === 'ECONNRESET') {
+        res.destroy();
+        return;
+      }
+      console.error(error);
+      sendFailure(req, res, 500, 'server_error', '서버에서 문제가 생겼습니다. 잠시 뒤 다시 시도해 주세요.');
+    }
+  }
+
+  const server = http.createServer(handle);
+  server.headersTimeout = 15 * 1000;
+  server.requestTimeout = 30 * 1000;
+
+  const pruneTimer = setInterval(() => limiter.prune(), 60 * 1000);
+  pruneTimer.unref();
+
+  let closed = false;
+  return {
+    server,
+    store,
+    generatedAdminPassword,
+    async close() {
+      if (closed) return;
+      closed = true;
+      clearInterval(pruneTimer);
+      if (server.listening) {
+        await new Promise((resolve) => {
+          server.close(resolve);
+          server.closeAllConnections();
+        });
+      }
+      store.close();
+    },
+  };
+}

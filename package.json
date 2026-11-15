@@ -1,0 +1,14 @@
+{
+  "name": "assignment-links",
+  "version": "1.0.0",
+  "description": "학생들에게서 과제 링크를 모으는 작은 웹 서비스",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test \"test/*.test.js\""
+  },
+  "engines": {
+    "node": ">=22.13"
+  }
+}
