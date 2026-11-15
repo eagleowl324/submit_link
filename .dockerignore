@@ -1,5 +1,11 @@
 data
 node_modules
+dist
+.wrangler
+.dev.vars
+cloudflare
+wrangler.jsonc
+package-lock.json
 test
 .git
 .gitignore

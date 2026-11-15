@@ -1,7 +1,7 @@
 import os from 'node:os';
 import path from 'node:path';
 
-import { ConfigError, DATABASE_FILE, ROOT, createApp, logoutAll, resetAdminPassword } from './app.js';
+import { ConfigError, DATABASE_FILE, ROOT, createNodeApp, logoutAll, resetAdminPassword } from './node.js';
 
 const HELP = `과제 링크 제출함
 
@@ -70,7 +70,7 @@ export async function main(argv, env) {
     throw new ConfigError(`TRUST_PROXY 는 0 이상의 숫자여야 합니다: ${env.TRUST_PROXY}`);
   }
 
-  const app = await createApp({ dataDir, adminPassword, trustProxy });
+  const app = await createNodeApp({ dataDir, adminPassword, trustProxy });
 
   await new Promise((resolve, reject) => {
     app.server.once('error', (error) => {

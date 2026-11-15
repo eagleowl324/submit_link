@@ -5,7 +5,8 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-import { createApp, isProxyPeer, logoutAll, rateKey, resetAdminPassword } from '../src/app.js';
+import { isProxyPeer, rateKey } from '../src/app.js';
+import { createNodeApp as createApp, logoutAll, resetAdminPassword } from '../src/node.js';
 
 const ADMIN_PASSWORD = 'teacher-password';
 
@@ -118,9 +119,11 @@ test('로그인: 틀린 비밀번호는 거절하고, 맞으면 안전한 쿠키
   assert.match(viaHttps.headers.get('set-cookie'), /; Secure/);
 
   const session = await request('GET', '/api/admin/session', { cookie: cookie.split(';')[0] });
-  assert.deepEqual(session.json, { authenticated: true });
+  assert.deepEqual(session.json, { authenticated: true, needsSetup: false, setup: 'console' });
   const anonymous = await request('GET', '/api/admin/session');
-  assert.deepEqual(anonymous.json, { authenticated: false }, '로그인 전에는 설정 정보를 알려 주지 않는다');
+  assert.deepEqual(anonymous.json, { authenticated: false, needsSetup: false, setup: 'console' }, '로그인 전에는 비밀번호가 어떻게 정해졌는지 알려 주지 않는다');
+  // 실행 창에 비밀번호를 보여 주는 방식에서는 화면에서 처음 정하는 기능이 꺼져 있다.
+  assert.equal((await request('POST', '/api/admin/setup', { body: { password: 'anything-long-enough' } })).status, 409);
   assert.equal((await request('GET', '/api/admin/overview', { cookie: cookie.split(';')[0] })).json.passwordFromEnv, true);
 });
 

@@ -8,6 +8,7 @@ const app = document.getElementById('app');
 const REFRESH_MS = 20 * 1000;
 
 const state = {
+  setup: 'console', // 관리자 비밀번호를 처음 정하는 방법: 'console'(서버 실행 창) | 'web'(이 화면)
   view: 'assignments', // 'assignments' | 'settings'
   overview: null, // { title, rosterCount, passwordFromEnv, assignments }
   selectedId: null,
@@ -973,7 +974,7 @@ function showLogin(notice) {
   const password = field({
     id: 'password',
     label: '관리자 비밀번호',
-    hint: '처음 실행했다면 서버 실행 창에 표시된 비밀번호를 입력하세요.',
+    hint: state.setup === 'console' ? '처음 실행했다면 서버 실행 창에 표시된 비밀번호를 입력하세요.' : null,
     control: h('input', { class: 'input', id: 'password', type: 'password', autocomplete: 'current-password', maxlength: LIMITS.adminPasswordMax }),
   });
   const submit = h('button', { class: 'button button-primary button-block', type: 'submit' }, '로그인');
@@ -1017,6 +1018,65 @@ function showLogin(notice) {
   password.input.focus();
 }
 
+// 관리자 비밀번호가 아직 없을 때: 처음 들어온 사람이 정합니다. (서버 실행 창이 없는 Cloudflare 배포에서 씁니다.)
+function showSetup() {
+  const passwordInput = (id) => h('input', { class: 'input', id, type: 'password', autocomplete: 'new-password', maxlength: LIMITS.adminPasswordMax });
+  const password = field({
+    id: 'setup-password',
+    label: '새 관리자 비밀번호',
+    hint: `${LIMITS.adminPasswordMin}자 이상으로 정하세요. 모든 제출 내용을 볼 수 있는 비밀번호이니 다른 곳에서 쓰지 않는 것으로 정하는 것이 좋습니다.`,
+    control: passwordInput('setup-password'),
+  });
+  const again = field({ id: 'setup-password-again', label: '한 번 더 입력', control: passwordInput('setup-password-again') });
+  const submit = h('button', { class: 'button button-primary button-block', type: 'submit' }, '비밀번호 정하고 시작하기');
+
+  app.replaceChildren(
+    h(
+      'main',
+      { class: 'login' },
+      h(
+        'form',
+        {
+          class: 'card login-card',
+          novalidate: true,
+          onsubmit: async (event) => {
+            event.preventDefault();
+            password.setError('');
+            again.setError('');
+            if (password.input.value.length < LIMITS.adminPasswordMin) {
+              password.setError(`비밀번호는 ${LIMITS.adminPasswordMin}자 이상으로 정하세요.`);
+              password.input.focus();
+              return;
+            }
+            if (password.input.value !== again.input.value) {
+              again.setError('위에 쓴 비밀번호와 다릅니다.');
+              again.input.focus();
+              return;
+            }
+            submit.disabled = true;
+            try {
+              await api('POST', '/api/admin/setup', { password: password.input.value });
+              await enter();
+            } catch (error) {
+              if (error.code === 'already_set') showLogin('관리자 비밀번호가 이미 정해져 있습니다. 로그인해 주세요.');
+              else password.setError(error.fields?.password || error.message);
+            } finally {
+              submit.disabled = false;
+            }
+          },
+        },
+        h('h1', { class: 'login-title' }, '관리자 비밀번호 만들기'),
+        h('p', { class: 'settings-lead' }, '이 사이트를 처음 여셨습니다. 관리 화면에 들어올 때 쓸 비밀번호를 정해 주세요. 처음 한 번만 하면 됩니다.'),
+        password.wrap,
+        again.wrap,
+        submit,
+      ),
+      h('a', { class: 'quiet-link', href: '/' }, '학생 화면으로 가기'),
+    ),
+  );
+  password.input.focus();
+}
+
 async function enter() {
   state.view = 'assignments';
   const wanted = Number(location.hash.replace(/^#a/, ''));
@@ -1028,7 +1088,9 @@ async function enter() {
 async function boot() {
   try {
     const session = await api('GET', '/api/admin/session');
+    state.setup = session.setup;
     if (session.authenticated) await enter();
+    else if (session.needsSetup) showSetup();
     else showLogin();
   } catch (error) {
     app.replaceChildren(

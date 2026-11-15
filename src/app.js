@@ -1,20 +1,19 @@
-import http from 'node:http';
-import path from 'node:path';
-import { isIP } from 'node:net';
-import { createHash } from 'node:crypto';
-import { chmodSync, mkdirSync, readFileSync, readdirSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
+// 서비스의 핵심 로직: 주소별 처리, 인증, 요청 제한.
+//
+// 이 파일은 특정 실행 환경에 묶이지 않습니다. 저장소(store)와 화면(pages), 정적 파일(assets)을 밖에서 받아서
+// Node.js(src/node.js)와 Cloudflare Workers(cloudflare/worker.js) 양쪽에서 같은 코드로 동작합니다.
+// 요청과 응답은 Node.js 의 req/res 모양을 따르고, Cloudflare 쪽은 같은 모양의 얇은 객체를 만들어 넘깁니다.
 
-import { Store } from './db.js';
+import { Buffer } from 'node:buffer';
+
 import {
   RateLimiter,
+  createHasher,
   generateAdminPassword,
-  hashPassword,
   newToken,
   randomSlug,
   sameSecret,
   sha256,
-  verifyPassword,
 } from './security.js';
 import {
   LIMITS,
@@ -25,9 +24,6 @@ import {
   validateRoster,
   validateSubmission,
 } from '../shared/rules.js';
-
-export const ROOT = fileURLToPath(new URL('..', import.meta.url));
-export const DATABASE_FILE = 'submissions.db';
 
 const DEFAULT_TITLE = '과제 링크 제출함';
 const SESSION_COOKIE = 'admin_session';
@@ -55,12 +51,6 @@ const SECURITY_HEADERS = {
 };
 const CONTENT_SECURITY_POLICY =
   "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
-
-const CONTENT_TYPES = {
-  '.css': 'text/css; charset=utf-8',
-  '.js': 'text/javascript; charset=utf-8',
-  '.svg': 'image/svg+xml',
-};
 
 const ALREADY_SUBMITTED =
   '이 학번으로 이미 제출된 링크가 있습니다. 처음 제출할 때 정한 비밀번호를 입력해야 고칠 수 있습니다. 비밀번호가 기억나지 않으면 선생님께 말씀드리세요.';
@@ -126,20 +116,22 @@ async function readJson(req, limit) {
   return body;
 }
 
-function loadAssets() {
-  const assets = new Map();
-  const addFolder = (prefix, folder) => {
-    for (const name of readdirSync(folder)) {
-      const type = CONTENT_TYPES[path.extname(name)];
-      if (!type) continue;
-      const body = readFileSync(path.join(folder, name));
-      const etag = `"${createHash('sha256').update(body).digest('base64url').slice(0, 22)}"`;
-      assets.set(prefix + name, { body, type, etag });
-    }
-  };
-  addFolder('', path.join(ROOT, 'public'));
-  addFolder('shared/', path.join(ROOT, 'shared'));
-  return assets;
+// 주소가 IPv4 면 4, IPv6 면 6, 둘 다 아니면 0. (node:net 없이도 돌도록 직접 확인합니다.)
+function ipFamily(ip) {
+  const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(ip);
+  if (v4) return v4.slice(1).every((part) => Number(part) <= 255) ? 4 : 0;
+  if (!ip.includes(':') || !/^[0-9a-f:.]+$/.test(ip)) return 0;
+  const halves = ip.split('::');
+  if (halves.length > 2) return 0;
+  const groups = halves.flatMap((half) => (half ? half.split(':') : []));
+  let count = 0;
+  for (const [index, group] of groups.entries()) {
+    if (/^[0-9a-f]{1,4}$/.test(group)) count += 1;
+    else if (index === groups.length - 1 && ipFamily(group) === 4) count += 2;
+    else return 0;
+  }
+  if (halves.length === 2) return count < 8 ? 6 : 0;
+  return count === 8 ? 6 : 0;
 }
 
 // 요청 제한에 쓰는 접속자 구분값.
@@ -155,7 +147,7 @@ export function rateKey(address) {
   const mapped = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/.exec(ip);
   if (mapped) ip = mapped[1];
 
-  const family = isIP(ip);
+  const family = ipFamily(ip);
   if (family === 4) return ip;
   if (family !== 6) return 'unknown';
   const [head, tail] = ip.split('::');
@@ -235,32 +227,29 @@ function compareForStudents(a, b) {
   return 0;
 }
 
-export async function resetAdminPassword(dataDir) {
-  mkdirSync(dataDir, { recursive: true });
-  const store = new Store(path.join(dataDir, DATABASE_FILE));
-  try {
-    const password = generateAdminPassword();
-    store.setSetting('admin_password_hash', await hashPassword(password));
-    store.deleteAllSessions();
-    return password;
-  } finally {
-    store.close();
-  }
-}
-
-// 모든 기기의 관리자 로그인을 끊습니다. (로그인한 기기를 잃어버렸을 때)
-export function logoutAll(dataDir) {
-  mkdirSync(dataDir, { recursive: true });
-  const store = new Store(path.join(dataDir, DATABASE_FILE));
-  try {
-    store.deleteAllSessions();
-  } finally {
-    store.close();
-  }
-}
-
+// options:
+//   store            저장소 (src/db.js 의 Store)
+//   pages            { student, admin } HTML 틀
+//   assets           정적 파일 Map (주소 → { body, type, etag }). 정적 파일을 다른 곳에서 내보내는 환경에서는 비워 둡니다.
+//   adminPassword    정해 두면 그 값이 관리자 비밀번호입니다.
+//   setup            관리자 비밀번호를 정해 두지 않았을 때의 첫 설정 방법.
+//                    'console' 은 무작위로 만들어 generatedAdminPassword 로 돌려주고(실행 창에 보여 줌),
+//                    'web' 은 관리 화면에 처음 들어온 사람이 정하게 합니다.
+//   trustProxy, clientIp, now, limits, hasher, limiter   아래 기본값 참고
 export async function createApp(options = {}) {
-  const { dataDir = path.join(ROOT, 'data'), adminPassword = '', trustProxy = 0, now = () => new Date(), limits = {} } = options;
+  const {
+    store,
+    pages,
+    assets = new Map(),
+    adminPassword = '',
+    setup = 'console',
+    trustProxy = 0,
+    clientIp: clientIpOverride = null,
+    now = () => new Date(),
+    limits = {},
+    hasher = createHasher(),
+    limiter = new RateLimiter(() => now().getTime()),
+  } = options;
   const maxSubmissions = limits.maxSubmissions ?? MAX_SUBMISSIONS_PER_ASSIGNMENT;
   const maxLinkChanges = limits.maxLinkChanges ?? MAX_LINK_CHANGES;
 
@@ -268,39 +257,24 @@ export async function createApp(options = {}) {
     throw new ConfigError(`ADMIN_PASSWORD 는 ${LIMITS.adminPasswordMin}자 이상이어야 합니다.`);
   }
 
-  let store;
-  try {
-    // 같은 컴퓨터의 다른 계정이 학생 정보를 읽지 못하게 폴더와 파일을 본인만 볼 수 있게 만듭니다.
-    mkdirSync(dataDir, { recursive: true, mode: 0o700 });
-    store = new Store(path.join(dataDir, DATABASE_FILE));
-    try {
-      chmodSync(path.join(dataDir, DATABASE_FILE), 0o600);
-    } catch {
-      // 권한을 바꿀 수 없는 파일 시스템에서는 그대로 둡니다.
-    }
-  } catch (error) {
-    throw new ConfigError(`데이터 폴더를 쓸 수 없습니다: ${dataDir}\n(${error.message})\nDATA_DIR 로 쓸 수 있는 폴더를 지정해 주세요.`);
-  }
-  const limiter = new RateLimiter(() => now().getTime());
-  const assets = loadAssets();
-  const studentPage = readFileSync(path.join(ROOT, 'public', 'index.html'), 'utf8');
-  const adminPage = readFileSync(path.join(ROOT, 'public', 'admin.html'), 'utf8');
-
-  // 비밀번호를 정해 주지 않았다면 처음 한 번 무작위로 만들어 알려 줍니다.
+  // 비밀번호를 정해 주지 않았다면 처음 한 번 무작위로 만들어 알려 줍니다. ('web' 방식에서는 관리 화면에서 정합니다.)
   let generatedAdminPassword = null;
-  if (!adminPassword && !store.getSetting('admin_password_hash')) {
+  if (setup === 'console' && !adminPassword && !store.getSetting('admin_password_hash')) {
     generatedAdminPassword = generateAdminPassword();
-    store.setSetting('admin_password_hash', await hashPassword(generatedAdminPassword));
+    store.setSetting('admin_password_hash', await hasher.hash(generatedAdminPassword));
   }
 
   // 관리자 비밀번호를 정하는 방식이나 값이 바뀌었으면(ADMIN_PASSWORD 를 바꾸거나 없앴으면) 예전 로그인을 모두 끊습니다.
   // 비밀번호를 바꿨는데 예전에 로그인해 둔 기기가 계속 들어올 수 있으면 안 되기 때문입니다.
   const authMarker = store.getSetting('admin_auth_marker');
-  const sameAuth = adminPassword ? Boolean(authMarker) && (await verifyPassword(adminPassword, authMarker)) : authMarker === 'stored';
+  const sameAuth = adminPassword ? Boolean(authMarker) && (await hasher.verify(adminPassword, authMarker)) : authMarker === 'stored';
   if (!sameAuth) {
     store.deleteAllSessions();
-    store.setSetting('admin_auth_marker', adminPassword ? await hashPassword(adminPassword) : 'stored');
+    store.setSetting('admin_auth_marker', adminPassword ? await hasher.hash(adminPassword) : 'stored');
   }
+
+  // 관리자 비밀번호가 아직 없어서 관리 화면에서 처음 정해야 하는 상태인가
+  const needsSetup = () => setup === 'web' && !adminPassword && !store.getSetting('admin_password_hash');
 
   const siteTitle = () => store.getSetting('site_title') || DEFAULT_TITLE;
   const rosterOnly = () => store.getSetting('roster_only') === '1';
@@ -333,6 +307,7 @@ export async function createApp(options = {}) {
 
   // 프록시 뒤에서는 TRUST_PROXY 만큼 떨어진 X-Forwarded-For 항목이 실제 접속자입니다.
   function clientIp(req) {
+    if (clientIpOverride) return clientIpOverride(req);
     const peer = req.socket.remoteAddress || '';
     if (trustProxy > 0 && isProxyPeer(peer)) {
       const forwarded = String(req.headers['x-forwarded-for'] || '')
@@ -378,7 +353,7 @@ export async function createApp(options = {}) {
     const key = `password:${assignmentId}:${studentId}`;
     const gate = limiter.take(key, PASSWORD_ATTEMPTS, ATTEMPT_WINDOW_MS);
     if (!gate.allowed) throw tooMany(gate.retryAfter, '비밀번호를 여러 번 틀려서 이 학번의 제출이 잠시 막혔습니다.');
-    if (!(await verifyPassword(password, storedHash))) {
+    if (!(await hasher.verify(password, storedHash))) {
       throw new HttpError(403, 'wrong_password', wrongMessage, { fields: { password: wrongMessage } });
     }
     limiter.reset(key);
@@ -388,7 +363,7 @@ export async function createApp(options = {}) {
     if (!password || password.length > LIMITS.adminPasswordMax) return false;
     if (adminPassword) return sameSecret(password, adminPassword);
     const stored = store.getSetting('admin_password_hash');
-    return stored ? verifyPassword(password, stored) : false;
+    return stored ? hasher.verify(password, stored) : false;
   }
 
   async function requireAdminPassword(req, password, error) {
@@ -416,20 +391,20 @@ export async function createApp(options = {}) {
   function pageStudent({ res, params }) {
     const title = siteTitle();
     if (!params[0]) {
-      sendHtml(res, 200, fillTemplate(studentPage, { title, description: '과제 링크를 제출하는 곳입니다.' }));
+      sendHtml(res, 200, fillTemplate(pages.student, { title, description: '과제 링크를 제출하는 곳입니다.' }));
       return;
     }
     const assignment = store.getAssignmentBySlug(params[0]);
     if (!assignment) {
-      sendHtml(res, 404, fillTemplate(studentPage, { title, description: '과제를 찾을 수 없습니다.' }));
+      sendHtml(res, 404, fillTemplate(pages.student, { title, description: '과제를 찾을 수 없습니다.' }));
       return;
     }
     const summary = singleLine(assignment.description).slice(0, 120) || '과제 링크를 제출하는 곳입니다.';
-    sendHtml(res, 200, fillTemplate(studentPage, { title: `${assignment.title} · ${title}`, description: summary }));
+    sendHtml(res, 200, fillTemplate(pages.student, { title: `${assignment.title} · ${title}`, description: summary }));
   }
 
   function pageAdmin({ res }) {
-    sendHtml(res, 200, fillTemplate(adminPage, { title: `관리 · ${siteTitle()}` }));
+    sendHtml(res, 200, fillTemplate(pages.admin, { title: `관리 · ${siteTitle()}` }));
   }
 
   function serveAsset({ req, res, params }) {
@@ -479,7 +454,7 @@ export async function createApp(options = {}) {
       await requireStudentPassword(assignment.id, value.studentId, value.password, existing.password_hash, ALREADY_SUBMITTED);
       passwordHash = existing.password_hash;
     } else {
-      passwordHash = await hashPassword(value.password);
+      passwordHash = await hasher.hash(value.password);
     }
 
     const saved = store.saveSubmission({
@@ -538,12 +513,33 @@ export async function createApp(options = {}) {
     const body = await readJson(req, BODY_LIMIT);
     const password = typeof body.password === 'string' ? body.password : '';
     await requireAdminPassword(req, password, new HttpError(401, 'wrong_password', '비밀번호가 맞지 않습니다.'));
+    startSession(req, res);
+  }
 
+  function startSession(req, res) {
     const at = now();
     store.pruneSessions(at.toISOString());
     const token = newToken();
     store.createSession(sha256(token), at.toISOString(), new Date(at.getTime() + SESSION_SECONDS * 1000).toISOString());
     sendJson(res, 200, { ok: true }, { 'Set-Cookie': sessionCookie(req, token, SESSION_SECONDS) });
+  }
+
+  // 관리자 비밀번호를 처음 정합니다. 아직 아무도 정하지 않았을 때 한 번만 됩니다('web' 방식).
+  async function apiSetup({ req, res }) {
+    if (!needsSetup()) throw new HttpError(409, 'already_set', '관리자 비밀번호가 이미 정해져 있습니다. 로그인해 주세요.');
+    const body = await readJson(req, BODY_LIMIT);
+    const password = typeof body.password === 'string' ? body.password : '';
+    if (password.length < LIMITS.adminPasswordMin) {
+      throw invalid({ password: `비밀번호는 ${LIMITS.adminPasswordMin}자 이상으로 정하세요.` });
+    }
+    if (password.length > LIMITS.adminPasswordMax) {
+      throw invalid({ password: `비밀번호는 ${LIMITS.adminPasswordMax}자까지 쓸 수 있습니다.` });
+    }
+    const hash = await hasher.hash(password);
+    // 해시를 계산하는 사이에 다른 사람이 먼저 정했다면 그쪽이 우선입니다.
+    if (!needsSetup()) throw new HttpError(409, 'already_set', '관리자 비밀번호가 이미 정해져 있습니다. 로그인해 주세요.');
+    store.setSetting('admin_password_hash', hash);
+    startSession(req, res);
   }
 
   function apiLogout({ req, res }) {
@@ -558,7 +554,8 @@ export async function createApp(options = {}) {
   }
 
   function apiSession({ req, res }) {
-    sendJson(res, 200, { authenticated: Boolean(currentSession(req)) });
+    // setup 은 로그인 화면이 알맞은 안내문을 고르는 데 씁니다.
+    sendJson(res, 200, { authenticated: Boolean(currentSession(req)), needsSetup: needsSetup(), setup });
   }
 
   function apiOverview({ res }) {
@@ -688,7 +685,7 @@ export async function createApp(options = {}) {
     const wrong = '현재 비밀번호가 맞지 않습니다.';
     await requireAdminPassword(req, currentPassword, new HttpError(403, 'wrong_password', wrong, { fields: { currentPassword: wrong } }));
 
-    store.setSetting('admin_password_hash', await hashPassword(newPassword));
+    store.setSetting('admin_password_hash', await hasher.hash(newPassword));
     store.deleteOtherSessions(session.tokenHash);
     sendJson(res, 200, { ok: true });
   }
@@ -702,7 +699,7 @@ export async function createApp(options = {}) {
     ['GET', new RegExp(`^/a/${SLUG}/?$`), pageStudent],
     ['GET', /^\/admin\/?$/, pageAdmin],
     ['GET', /^\/assets\/([\w./-]+)$/, serveAsset],
-    ['GET', /^\/favicon\.ico$/, (context) => serveAsset({ ...context, params: ['favicon.svg'] })],
+    ['GET', /^\/favicon\.ico$/, ({ res }) => send(res, 302, '', { Location: '/assets/favicon.svg', 'Cache-Control': 'no-cache' })],
     ['GET', /^\/robots\.txt$/, ({ res }) => sendText(res, 200, 'User-agent: *\nDisallow: /\n')],
     ['GET', /^\/healthz$/, ({ res }) => sendText(res, 200, 'ok\n')],
 
@@ -712,6 +709,7 @@ export async function createApp(options = {}) {
 
     ['GET', /^\/api\/admin\/session$/, apiSession],
     ['POST', /^\/api\/admin\/login$/, apiLogin],
+    ['POST', /^\/api\/admin\/setup$/, apiSetup],
     ['POST', /^\/api\/admin\/logout$/, apiLogout],
     ['POST', /^\/api\/admin\/logout-others$/, admin(apiLogoutOthers)],
     ['GET', /^\/api\/admin\/overview$/, admin(apiOverview)],
@@ -772,8 +770,19 @@ export async function createApp(options = {}) {
     else sendText(res, status, `${message}\n`, headers);
   }
 
+  // 만료된 횟수 기록과 로그인을 가끔 치웁니다. 타이머 없이 요청이 올 때 처리해서 어떤 실행 환경에서도 같게 동작합니다.
+  let lastCleanup = now().getTime();
+  function cleanUp() {
+    const at = now();
+    if (at.getTime() - lastCleanup < 60 * 1000) return;
+    lastCleanup = at.getTime();
+    limiter.prune();
+    store.pruneSessions(at.toISOString());
+  }
+
   async function handle(req, res) {
     try {
+      cleanUp();
       await route(req, res);
     } catch (error) {
       if (res.headersSent || res.destroyed) {
@@ -794,29 +803,5 @@ export async function createApp(options = {}) {
     }
   }
 
-  const server = http.createServer(handle);
-  server.headersTimeout = 15 * 1000;
-  server.requestTimeout = 30 * 1000;
-
-  const pruneTimer = setInterval(() => limiter.prune(), 60 * 1000);
-  pruneTimer.unref();
-
-  let closed = false;
-  return {
-    server,
-    store,
-    generatedAdminPassword,
-    async close() {
-      if (closed) return;
-      closed = true;
-      clearInterval(pruneTimer);
-      if (server.listening) {
-        await new Promise((resolve) => {
-          server.close(resolve);
-          server.closeAllConnections();
-        });
-      }
-      store.close();
-    },
-  };
+  return { handle, store, generatedAdminPassword };
 }

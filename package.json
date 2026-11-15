@@ -6,9 +6,15 @@
   "type": "module",
   "scripts": {
     "start": "node server.js",
-    "test": "node --test \"test/*.test.js\""
+    "test": "node --test \"test/*.test.js\"",
+    "cf:dev": "wrangler dev",
+    "cf:deploy": "wrangler deploy",
+    "test:cloudflare": "node test/cloudflare-smoke.mjs"
   },
   "engines": {
     "node": ">=22.13"
+  },
+  "devDependencies": {
+    "wrangler": "^4.162.0"
   }
 }
